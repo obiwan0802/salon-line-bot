@@ -1664,10 +1664,10 @@ scheduler.start()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ヘルスチェック
+# トップページ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @app.route("/")
-def health():
+def index():
     return f"{STORE_NAME} LINE予約Bot is running!"
 
 
