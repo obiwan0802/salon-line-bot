@@ -1,20 +1,18 @@
 """
-サロン・美容室向け LINE予約Bot
-- スタッフ指名予約（指名なし＝自動割り当て）
-- スタッフ別の空き枠管理
-- Supabaseデータベースで予約・顧客・スタッフデータを永続化
-- キャンセル機能
-- 定休日・スタッフ個別休日対応
+飲食店向け LINE予約Bot — Phase 2（オーナーダッシュボード付き）
+- Supabaseデータベースで予約・顧客データを永続化
+- キャンセル・変更機能
+- 定休日・臨時休業対応
 - Googleカレンダー連携
 - オーナーLINE通知 / 前日リマインド
-- Webダッシュボード（予約管理・スタッフ管理・定休日設定・顧客リスト）
+- Webダッシュボード（予約管理・定休日設定・顧客リスト）
 """
 
 import os
 import json
-import re
 import datetime
 import logging
+import re
 import calendar as cal_module
 from zoneinfo import ZoneInfo
 
@@ -61,16 +59,21 @@ GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 # 店舗設定
-STORE_NAME = os.environ.get("STORE_NAME", "サンプルサロン")
-STORE_OPEN_HOUR = int(os.environ.get("STORE_OPEN_HOUR", "9"))
-STORE_CLOSE_HOUR = int(os.environ.get("STORE_CLOSE_HOUR", "20"))
+STORE_NAME = os.environ.get("STORE_NAME", "サンプルレストラン")
+STORE_OPEN_HOUR = int(os.environ.get("STORE_OPEN_HOUR", "11"))
+STORE_CLOSE_HOUR = int(os.environ.get("STORE_CLOSE_HOUR", "22"))
+MAX_SEATS = int(os.environ.get("MAX_SEATS", "30"))
 SLOT_INTERVAL_MINUTES = int(os.environ.get("SLOT_INTERVAL_MINUTES", "30"))
-BOOKING_DEADLINE_HOURS = int(os.environ.get("BOOKING_DEADLINE_HOURS", "1"))
+BOOKING_DEADLINE_HOURS = int(os.environ.get("BOOKING_DEADLINE_HOURS", "2"))  # 予約締切（何時間前）
 
 # ダッシュボード認証
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 if not DASHBOARD_PASSWORD:
     logger.warning("⚠️ DASHBOARD_PASSWORD が未設定です。必ず環境変数で設定してください。")
+
+BRAND_COLOR = "#E05241"  # 飲食店版（赤系）
+
+JST = ZoneInfo("Asia/Tokyo")
 
 
 def dashboard_auth_required(f):
@@ -83,11 +86,6 @@ def dashboard_auth_required(f):
             return redirect(url_for("dashboard_login"))
         return f(*args, **kwargs)
     return decorated
-
-# ブランドカラー
-BRAND_COLOR = "#9B59B6"  # パープル系（サロン向け）
-
-JST = ZoneInfo("Asia/Tokyo")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 入力バリデーション・サニタイズ
@@ -103,7 +101,7 @@ def sanitize_text(text, max_length=100):
 def validate_phone(phone):
     """電話番号バリデーション（日本の電話番号形式）"""
     if not phone:
-        return True, ""
+        return True, ""  # 空は許容（任意入力の場合）
     cleaned = re.sub(r"[\s\-‐‑‒–—―ー－]", "", phone)
     if re.match(r"^(0\d{9,10}|\+81\d{9,10})$", cleaned):
         return True, cleaned
@@ -117,6 +115,7 @@ def validate_name(name):
     name = name.strip()
     if len(name) > 50:
         return False, ""
+    # HTMLタグを除去
     sanitized = re.sub(r"<[^>]+>", "", name)
     return True, sanitized
 
@@ -142,46 +141,39 @@ SUPABASE_HEADERS = {
     "Prefer": "return=representation",
 }
 
-
 def supabase_get(table, params=None):
+    """Supabase REST API GET"""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     res = http_requests.get(url, headers=SUPABASE_HEADERS, params=params or {})
     res.raise_for_status()
     return res.json()
 
-
 def supabase_post(table, data):
+    """Supabase REST API POST (INSERT)"""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     res = http_requests.post(url, headers=SUPABASE_HEADERS, json=data)
+    if not res.ok:
+        logger.error(f"Supabase POST エラー: {res.status_code} {res.text}")
     res.raise_for_status()
     return res.json()
 
-
 def supabase_patch(table, data, params):
+    """Supabase REST API PATCH (UPDATE)"""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     res = http_requests.patch(url, headers=SUPABASE_HEADERS, json=data, params=params)
     res.raise_for_status()
     return res.json()
 
-
-def supabase_delete(table, params):
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    res = http_requests.delete(url, headers=SUPABASE_HEADERS, params=params)
-    res.raise_for_status()
-    return True
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# メニュー設定（施術メニュー）
+# メニュー設定
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MENU_ITEMS = [
-    {"id": "cut", "name": "カット", "price": 4400, "duration": 60, "emoji": "✂️"},
-    {"id": "color", "name": "カラー", "price": 6600, "duration": 90, "emoji": "🎨"},
-    {"id": "cut_color", "name": "カット+カラー", "price": 9900, "duration": 120, "emoji": "✂️🎨"},
-    {"id": "perm", "name": "パーマ", "price": 7700, "duration": 120, "emoji": "🌀"},
-    {"id": "cut_perm", "name": "カット+パーマ", "price": 11000, "duration": 150, "emoji": "✂️🌀"},
-    {"id": "treatment", "name": "トリートメント", "price": 3300, "duration": 45, "emoji": "💆"},
-    {"id": "head_spa", "name": "ヘッドスパ", "price": 4400, "duration": 60, "emoji": "🧖"},
+    {"id": "seat_only", "name": "席のみ予約", "price": 0, "duration": 120, "emoji": "💺"},
+    {"id": "lunch_a", "name": "ランチコースA", "price": 1500, "duration": 60, "emoji": "🍽️"},
+    {"id": "lunch_b", "name": "ランチコースB", "price": 2500, "duration": 90, "emoji": "🥗"},
+    {"id": "dinner_standard", "name": "ディナースタンダード", "price": 4000, "duration": 90, "emoji": "🍷"},
+    {"id": "dinner_premium", "name": "ディナープレミアム", "price": 6000, "duration": 120, "emoji": "✨"},
+    {"id": "party", "name": "パーティーコース", "price": 5000, "duration": 150, "emoji": "🎉"},
 ]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -200,7 +192,6 @@ def session_get(uid):
         if not rows:
             return None
         row = rows[0]
-        # 期限切れチェック
         expires = datetime.datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
         if expires < datetime.datetime.now(datetime.timezone.utc):
             session_delete(uid)
@@ -221,7 +212,6 @@ def session_set(uid, data):
             "session_data": data,
             "expires_at": expires,
         }
-        # UPSERT（on conflict update）
         headers = {**SUPABASE_HEADERS, "Prefer": "return=representation,resolution=merge-duplicates"}
         url = f"{SUPABASE_URL}/rest/v1/reservation_sessions"
         res = http_requests.post(url, headers=headers, json=payload)
@@ -231,7 +221,7 @@ def session_set(uid, data):
 
 
 def session_update(uid, updates):
-    """既存セッションの一部フィールドを更新。セッションがなければ何もしない。"""
+    """既存セッションの一部フィールドを更新。"""
     current = session_get(uid)
     if current is None:
         return None
@@ -249,7 +239,7 @@ def session_delete(uid):
 
 
 def cleanup_expired_sessions():
-    """期限切れセッションを一括削除（スケジューラから呼出）。"""
+    """期限切れセッションを一括削除。"""
     try:
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         supabase_delete("reservation_sessions", {"expires_at": f"lt.{now}"})
@@ -258,52 +248,10 @@ def cleanup_expired_sessions():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# スタッフ取得
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def db_get_active_staff():
-    """有効なスタッフ一覧を取得"""
-    try:
-        rows = supabase_get("staff", {
-            "select": "*",
-            "is_active": "eq.true",
-            "order": "sort_order.asc",
-        })
-        return rows or []
-    except Exception as e:
-        logger.error(f"スタッフ取得エラー: {e}")
-        return []
-
-
-def db_is_staff_off(staff_id, date_str):
-    """指定スタッフが指定日に休みかチェック"""
-    try:
-        date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-        dow = date_obj.weekday()
-        # 特定日の休み
-        rows1 = supabase_get("staff_days_off", {
-            "select": "id",
-            "staff_id": f"eq.{staff_id}",
-            "off_date": f"eq.{date_str}",
-        })
-        if rows1:
-            return True
-        # 毎週の休み
-        rows2 = supabase_get("staff_days_off", {
-            "select": "id",
-            "staff_id": f"eq.{staff_id}",
-            "day_of_week": f"eq.{dow}",
-            "is_recurring": "eq.true",
-        })
-        return bool(rows2)
-    except Exception as e:
-        logger.error(f"スタッフ休日チェックエラー: {e}")
-        return False
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Supabase データ操作
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def db_get_or_create_customer(line_user_id, display_name=None):
+    """顧客を取得、なければ新規作成"""
     try:
         rows = supabase_get("customers", {"line_user_id": f"eq.{line_user_id}", "select": "*"})
         if rows:
@@ -319,15 +267,29 @@ def db_get_or_create_customer(line_user_id, display_name=None):
 
 
 def db_save_reservation(reservation_data):
+    """予約をDBに保存"""
     try:
+        # source未指定ならlineをデフォルト
+        if "source" not in reservation_data:
+            reservation_data["source"] = "line"
         res = supabase_post("reservations", reservation_data)
         return res[0] if res else None
     except Exception as e:
         logger.error(f"予約保存エラー: {e}")
+        # source/memoカラム未追加の場合、それらを除外して再試行
+        if "source" in reservation_data or "memo" in reservation_data:
+            logger.info("source/memoカラム未対応の可能性 → カラム除外で再試行")
+            fallback_data = {k: v for k, v in reservation_data.items() if k not in ("source", "memo")}
+            try:
+                res = supabase_post("reservations", fallback_data)
+                return res[0] if res else None
+            except Exception as e2:
+                logger.error(f"予約保存エラー（再試行）: {e2}")
         return None
 
 
 def db_get_user_reservations(line_user_id):
+    """ユーザーの未来の有効な予約を取得"""
     today = datetime.datetime.now(JST).strftime("%Y-%m-%d")
     try:
         rows = supabase_get("reservations", {
@@ -344,6 +306,7 @@ def db_get_user_reservations(line_user_id):
 
 
 def db_cancel_reservation(reservation_id, line_user_id):
+    """予約をキャンセル"""
     try:
         res = supabase_patch("reservations", {"status": "cancelled"}, {
             "id": f"eq.{reservation_id}",
@@ -356,6 +319,7 @@ def db_cancel_reservation(reservation_id, line_user_id):
 
 
 def db_get_reservations_by_date(date_str):
+    """指定日の有効な予約を全件取得"""
     try:
         rows = supabase_get("reservations", {
             "select": "*",
@@ -369,6 +333,7 @@ def db_get_reservations_by_date(date_str):
 
 
 def db_get_tomorrow_reminders():
+    """翌日の未リマインド予約を取得"""
     tomorrow = (datetime.datetime.now(JST) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     try:
         rows = supabase_get("reservations", {
@@ -384,6 +349,7 @@ def db_get_tomorrow_reminders():
 
 
 def db_mark_reminded(reservation_id):
+    """リマインド送信済みにマーク"""
     try:
         supabase_patch("reservations", {"reminded": True}, {"id": f"eq.{reservation_id}"})
     except Exception as e:
@@ -391,6 +357,7 @@ def db_mark_reminded(reservation_id):
 
 
 def db_update_customer_visit(line_user_id, name=None, phone=None):
+    """顧客の来店回数・情報を更新"""
     try:
         customer = db_get_or_create_customer(line_user_id)
         if customer:
@@ -405,18 +372,29 @@ def db_update_customer_visit(line_user_id, name=None, phone=None):
 
 
 def db_is_closed_day(date_str):
+    """指定日が定休日・臨時休業かチェック"""
     try:
         date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-        day_of_week = date_obj.weekday()
-        rows1 = supabase_get("closed_days", {"select": "*", "closed_date": f"eq.{date_str}"})
+        day_of_week = date_obj.weekday()  # 0=月〜6=日
+
+        # 特定日の休業チェック
+        rows1 = supabase_get("closed_days", {
+            "select": "*",
+            "closed_date": f"eq.{date_str}",
+        })
         if rows1:
             return True
+
+        # 毎週の定休日チェック
         rows2 = supabase_get("closed_days", {
             "select": "*",
             "day_of_week": f"eq.{day_of_week}",
             "is_recurring": "eq.true",
         })
-        return bool(rows2)
+        if rows2:
+            return True
+
+        return False
     except Exception as e:
         logger.error(f"定休日チェックエラー: {e}")
         return False
@@ -442,7 +420,9 @@ def create_calendar_event(reservation):
     if not service:
         return None
 
-    staff_text = reservation.get("staff_name") or "指名なし"
+    menu = next((m for m in MENU_ITEMS if m["id"] == reservation["menu_id"]), None)
+    if not menu:
+        return None
 
     start_dt = datetime.datetime.strptime(
         f"{reservation['reservation_date']} {reservation['reservation_time']}",
@@ -450,18 +430,24 @@ def create_calendar_event(reservation):
     ).replace(tzinfo=JST)
     end_dt = start_dt + datetime.timedelta(minutes=reservation["duration_minutes"])
 
+    source = reservation.get("source", "line")
+    source_label = "📞電話" if source == "phone" else "LINE"
+    memo_text = f"\nメモ: {reservation['memo']}" if reservation.get("memo") else ""
+
     event = {
-        "summary": f"【予約】{reservation['guest_name']} / {staff_text}",
+        "summary": f"【{source_label}予約】{reservation['guest_name']} {reservation['guests']}名",
         "description": (
-            f"施術: {reservation['menu_name']}\n"
-            f"担当: {staff_text}\n"
+            f"予約経路: {source_label}\n"
+            f"コース: {reservation['menu_name']}\n"
+            f"人数: {reservation['guests']}名\n"
             f"お名前: {reservation['guest_name']}\n"
             f"電話番号: {reservation.get('phone', '未設定')}\n"
-            f"料金: ¥{reservation.get('total_price', 0):,}"
+            f"予約金額: ¥{reservation.get('total_price', 0):,}"
+            f"{memo_text}"
         ),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Tokyo"},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Tokyo"},
-        "colorId": "3",  # ラベンダー
+        "colorId": "9",
     }
 
     try:
@@ -473,6 +459,7 @@ def create_calendar_event(reservation):
 
 
 def delete_calendar_event(event_id):
+    """Googleカレンダーのイベントを削除"""
     service = get_calendar_service()
     if not service or not event_id:
         return
@@ -486,6 +473,7 @@ def delete_calendar_event(event_id):
 # 店舗設定（DB）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def db_get_setting(key, default=None):
+    """設定値をDBから取得"""
     try:
         rows = supabase_get("store_settings", {"select": "value", "key": f"eq.{key}"})
         if rows:
@@ -497,6 +485,7 @@ def db_get_setting(key, default=None):
 
 
 def db_set_setting(key, value):
+    """設定値をDBに保存（なければ作成、あれば更新）"""
     try:
         rows = supabase_get("store_settings", {"select": "key", "key": f"eq.{key}"})
         if rows:
@@ -508,6 +497,7 @@ def db_set_setting(key, value):
 
 
 def get_booking_deadline_hours():
+    """現在の予約締切時間を取得（時間単位）"""
     val = db_get_setting("booking_deadline_hours")
     if val is not None:
         try:
@@ -518,31 +508,18 @@ def get_booking_deadline_hours():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 空き枠計算（スタッフベース）
+# 空き枠計算（DB版）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def get_available_slots(date_str, staff_id, duration_minutes):
-    """指定日・指定スタッフの空き枠を返す。staff_id=0は「指名なし」"""
+def get_available_slots(date_str, guests, duration_minutes):
     now = datetime.datetime.now(JST)
     target_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=JST)
 
+    # 定休日チェック
     if db_is_closed_day(date_str):
         return []
 
+    # DBから当日の予約を1回で取得
     day_reservations = db_get_reservations_by_date(date_str)
-    active_staff = db_get_active_staff()
-
-    # 指名なしの場合：全スタッフの中で空いている人がいる枠を返す
-    # 指名ありの場合：そのスタッフの枠だけを返す
-    if staff_id == 0:
-        # その日出勤しているスタッフを取得
-        working_staff = [s for s in active_staff if not db_is_staff_off(s["id"], date_str)]
-        if not working_staff:
-            return []
-        target_staff_ids = [s["id"] for s in working_staff]
-    else:
-        if db_is_staff_off(staff_id, date_str):
-            return []
-        target_staff_ids = [staff_id]
 
     slots = []
     hour = STORE_OPEN_HOUR
@@ -552,6 +529,7 @@ def get_available_slots(date_str, staff_id, duration_minutes):
         time_str = f"{hour:02d}:{minute:02d}"
         slot_time = target_date.replace(hour=hour, minute=minute)
 
+        # 予約締切チェック（現在時刻 + 締切時間 以内の枠は除外）
         deadline_hours = get_booking_deadline_hours()
         deadline = now + datetime.timedelta(hours=deadline_hours)
         if slot_time <= deadline:
@@ -567,30 +545,19 @@ def get_available_slots(date_str, staff_id, duration_minutes):
         ):
             break
 
-        # この時間帯に空いているスタッフがいるか判定
-        available_staff_ids = []
-        for sid in target_staff_ids:
-            is_busy = False
-            for r in day_reservations:
-                if r.get("staff_id") != sid:
-                    continue
-                r_start = datetime.datetime.strptime(
-                    f"{r['reservation_date']} {r['reservation_time']}", "%Y-%m-%d %H:%M"
-                ).replace(tzinfo=JST)
-                r_end = r_start + datetime.timedelta(minutes=r.get("duration_minutes", 60))
-                # 予約時間帯が重なっているかチェック
-                if slot_time < r_end and end_time > r_start:
-                    is_busy = True
-                    break
-            if not is_busy:
-                available_staff_ids.append(sid)
+        # 予約済み席数をメモリ内で計算
+        reserved_seats = 0
+        for r in day_reservations:
+            r_start = datetime.datetime.strptime(
+                f"{r['reservation_date']} {r['reservation_time']}", "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=JST)
+            r_end = r_start + datetime.timedelta(minutes=r.get("duration_minutes", 60))
+            if r_start <= slot_time < r_end:
+                reserved_seats += r["guests"]
 
-        if available_staff_ids:
-            slots.append({
-                "time": time_str,
-                "available_staff_ids": available_staff_ids,
-                "available_count": len(available_staff_ids),
-            })
+        available = MAX_SEATS - reserved_seats
+        if available >= guests:
+            slots.append({"time": time_str, "available": available})
 
         minute += SLOT_INTERVAL_MINUTES
         if minute >= 60:
@@ -598,18 +565,6 @@ def get_available_slots(date_str, staff_id, duration_minutes):
             minute = 0
 
     return slots
-
-
-def auto_assign_staff(date_str, time_str, duration_minutes, available_staff_ids):
-    """指名なしの場合、空いているスタッフの中で予約数が少ない人を自動割り当て"""
-    day_reservations = db_get_reservations_by_date(date_str)
-    staff_counts = {}
-    for sid in available_staff_ids:
-        count = sum(1 for r in day_reservations if r.get("staff_id") == sid)
-        staff_counts[sid] = count
-    # 予約数が少ないスタッフを優先
-    best_id = min(available_staff_ids, key=lambda x: staff_counts.get(x, 0))
-    return best_id
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -627,7 +582,7 @@ def build_welcome_flex():
                 {"type": "text", "text": "LINE予約システム", "size": "sm",
                  "color": "#FFFFFFCC", "align": "center", "margin": "sm"},
             ],
-            "backgroundColor": BRAND_COLOR,
+            "backgroundColor": "#E05241",
             "paddingAll": "20px",
         },
         "body": {
@@ -642,7 +597,7 @@ def build_welcome_flex():
             "type": "box", "layout": "vertical",
             "contents": [
                 {"type": "button", "action": {"type": "postback", "label": "📅 予約する",
-                 "data": "action=start_reservation"}, "style": "primary", "color": BRAND_COLOR},
+                 "data": "action=start_reservation"}, "style": "primary", "color": "#E05241"},
                 {"type": "button", "action": {"type": "postback", "label": "📋 予約を確認する",
                  "data": "action=check_reservation"}, "style": "secondary", "margin": "sm"},
                 {"type": "button", "action": {"type": "postback", "label": "❌ 予約をキャンセル",
@@ -663,8 +618,8 @@ def build_menu_flex():
                     {"type": "text", "text": item["emoji"], "size": "3xl", "align": "center"},
                     {"type": "text", "text": item["name"], "weight": "bold", "size": "sm",
                      "align": "center", "margin": "md", "wrap": True},
-                    {"type": "text", "text": f"¥{item['price']:,}", "size": "lg",
-                     "color": BRAND_COLOR, "align": "center", "weight": "bold", "margin": "sm"},
+                    {"type": "text", "text": f"¥{item['price']:,}/人", "size": "lg",
+                     "color": "#E05241", "align": "center", "weight": "bold", "margin": "sm"},
                     {"type": "text", "text": f"所要時間: 約{item['duration']}分", "size": "xs",
                      "color": "#999999", "align": "center", "margin": "sm"},
                 ],
@@ -675,7 +630,7 @@ def build_menu_flex():
                 "contents": [
                     {"type": "button", "action": {"type": "postback", "label": "選択",
                      "data": f"action=select_menu&menu_id={item['id']}"},
-                     "style": "primary", "color": BRAND_COLOR, "height": "sm"}
+                     "style": "primary", "color": "#E05241", "height": "sm"}
                 ],
             },
         }
@@ -683,68 +638,43 @@ def build_menu_flex():
     return {"type": "carousel", "contents": bubbles}
 
 
-def build_staff_flex():
-    """スタッフ選択Flex（指名なしオプション付き）"""
-    staff_list = db_get_active_staff()
-
-    bubbles = []
-    # 「指名なし」オプション
-    bubbles.append({
-        "type": "bubble", "size": "micro",
+def build_guests_flex():
+    buttons = []
+    for n in range(1, 9):
+        buttons.append({
+            "type": "button",
+            "action": {"type": "postback", "label": f"{n}名",
+                       "data": f"action=select_guests&guests={n}"},
+            "style": "secondary", "height": "sm", "margin": "sm",
+        })
+    rows = []
+    for i in range(0, len(buttons), 2):
+        rows.append({"type": "box", "layout": "horizontal",
+                      "contents": buttons[i:i+2], "spacing": "md",
+                      "margin": "md"})
+    return {
+        "type": "bubble",
         "body": {
             "type": "box", "layout": "vertical",
+            "paddingAll": "xl",
+            "spacing": "sm",
             "contents": [
-                {"type": "text", "text": "🔄", "size": "3xl", "align": "center"},
-                {"type": "text", "text": "指名なし", "weight": "bold", "size": "sm",
-                 "align": "center", "margin": "md"},
-                {"type": "text", "text": "空いているスタッフに\n自動でお任せ", "size": "xxs",
-                 "color": "#999999", "align": "center", "margin": "sm", "wrap": True},
-            ],
-            "paddingAll": "12px",
-        },
-        "footer": {
-            "type": "box", "layout": "vertical",
-            "contents": [
-                {"type": "button", "action": {"type": "postback", "label": "選択",
-                 "data": "action=select_staff&staff_id=0"},
-                 "style": "primary", "color": "#888888", "height": "sm"}
+                {"type": "text", "text": "👥 人数を選択", "weight": "bold", "size": "lg"},
+                {"type": "text", "text": "ご来店人数をお選びください",
+                 "size": "sm", "color": "#666666", "margin": "md"},
+                {"type": "separator", "margin": "lg"},
+                *rows,
             ],
         },
-    })
-
-    for s in staff_list:
-        bubble = {
-            "type": "bubble", "size": "micro",
-            "body": {
-                "type": "box", "layout": "vertical",
-                "contents": [
-                    {"type": "text", "text": s.get("emoji", "💇"), "size": "3xl", "align": "center"},
-                    {"type": "text", "text": s["name"], "weight": "bold", "size": "sm",
-                     "align": "center", "margin": "md", "wrap": True},
-                    {"type": "text", "text": s.get("role", ""), "size": "xxs",
-                     "color": "#999999", "align": "center", "margin": "sm"},
-                ],
-                "paddingAll": "12px",
-            },
-            "footer": {
-                "type": "box", "layout": "vertical",
-                "contents": [
-                    {"type": "button", "action": {"type": "postback", "label": "指名する",
-                     "data": f"action=select_staff&staff_id={s['id']}"},
-                     "style": "primary", "color": BRAND_COLOR, "height": "sm"}
-                ],
-            },
-        }
-        bubbles.append(bubble)
-
-    return {"type": "carousel", "contents": bubbles}
+    }
 
 
-def build_date_flex():
-    """カレンダー型の日付選択（3ヶ月分カルーセル）"""
+def build_date_flex(month_offset=0):
+    """カレンダー型の日付選択（1ヶ月表示＋前月/翌月ボタン）"""
     today = datetime.datetime.now(JST)
     today_date = today.date()
 
+    # 定休日データを一括取得（APIコール削減）
     try:
         all_closed = supabase_get("closed_days", {"select": "*"})
     except Exception:
@@ -764,260 +694,320 @@ def build_date_flex():
         return d.strftime("%Y-%m-%d") in specific_dates
 
     weekday_labels = ["月", "火", "水", "木", "金", "土", "日"]
-    bubbles = []
 
-    for month_offset in range(3):
-        year = today.year
-        month = today.month + month_offset
-        while month > 12:
-            year += 1
-            month -= 12
+    year = today.year
+    month = today.month + month_offset
+    while month > 12:
+        year += 1
+        month -= 12
 
-        weeks = cal_module.monthcalendar(year, month)
+    weeks = cal_module.monthcalendar(year, month)
 
-        header_row = {
-            "type": "box", "layout": "horizontal", "margin": "md",
-            "contents": [
-                {"type": "text", "text": wd, "size": "xxs", "align": "center", "flex": 1,
-                 "color": BRAND_COLOR if i == 6 else "#1565c0" if i == 5 else "#888888"}
-                for i, wd in enumerate(weekday_labels)
-            ],
-        }
+    # ── ナビゲーションヘッダー（◀ 2026年5月 ▶）──
+    nav_contents = []
+    if month_offset > 0:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "action": {"type": "postback", "label": "前月",
+                       "data": f"action=calendar_nav&offset={month_offset - 1}"},
+            "contents": [{"type": "text", "text": "◀", "size": "xl",
+                          "align": "center", "color": "#E05241"}],
+            "justifyContent": "center", "alignItems": "center",
+        })
+    else:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "contents": [{"type": "text", "text": " ", "size": "xl", "align": "center"}],
+        })
 
-        rows = [
-            {"type": "text", "text": f"{year}年{month}月", "weight": "bold",
-             "size": "md", "align": "center"},
-            {"type": "separator", "margin": "sm"},
-            header_row,
-        ]
+    nav_contents.append({
+        "type": "text", "text": f"{year}年{month}月", "weight": "bold",
+        "size": "xl", "align": "center", "flex": 3,
+    })
 
-        for week in weeks:
-            row_contents = []
-            for i, day in enumerate(week):
-                if day == 0:
+    if month_offset < 2:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "action": {"type": "postback", "label": "翌月",
+                       "data": f"action=calendar_nav&offset={month_offset + 1}"},
+            "contents": [{"type": "text", "text": "▶", "size": "xl",
+                          "align": "center", "color": "#E05241"}],
+            "justifyContent": "center", "alignItems": "center",
+        })
+    else:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "contents": [{"type": "text", "text": " ", "size": "xl", "align": "center"}],
+        })
+
+    nav_row = {
+        "type": "box", "layout": "horizontal",
+        "contents": nav_contents, "alignItems": "center",
+        "paddingBottom": "md",
+    }
+
+    # ── 曜日ヘッダー ──
+    header_row = {
+        "type": "box", "layout": "horizontal", "margin": "md",
+        "contents": [
+            {"type": "text", "text": wd, "size": "sm", "align": "center", "flex": 1,
+             "weight": "bold",
+             "color": "#E05241" if i == 6 else "#1565c0" if i == 5 else "#888888"}
+            for i, wd in enumerate(weekday_labels)
+        ],
+    }
+
+    rows = [nav_row, {"type": "separator", "margin": "sm"}, header_row]
+
+    # ── 日付セル ──
+    for week in weeks:
+        row_contents = []
+        for i, day in enumerate(week):
+            if day == 0:
+                row_contents.append({
+                    "type": "box", "layout": "vertical", "flex": 1,
+                    "height": "40px", "justifyContent": "center",
+                    "contents": [{"type": "text", "text": " ", "size": "md", "align": "center"}],
+                })
+            else:
+                d = datetime.date(year, month, day)
+                date_str = d.strftime("%Y-%m-%d")
+                is_past = d < today_date
+                closed = is_closed(d)
+
+                if is_past:
                     row_contents.append({
                         "type": "box", "layout": "vertical", "flex": 1,
-                        "contents": [{"type": "text", "text": " ", "size": "sm", "align": "center"}],
+                        "height": "40px", "justifyContent": "center",
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": "#DDDDDD"}],
+                    })
+                elif closed:
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "action": {"type": "postback", "label": "定休日",
+                                   "data": "action=closed_day"},
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": "#CCCCCC",
+                                      "decoration": "line-through"}],
+                    })
+                elif d == today_date:
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "action": {"type": "postback", "label": str(day),
+                                   "data": f"action=select_date&date={date_str}"},
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": "#FFFFFF",
+                                      "weight": "bold"}],
+                        "backgroundColor": "#E05241", "cornerRadius": "20px",
                     })
                 else:
-                    d = datetime.date(year, month, day)
-                    date_str = d.strftime("%Y-%m-%d")
-                    is_past = d < today_date
-                    closed = is_closed(d)
+                    color = "#E05241" if i == 6 else "#1565c0" if i == 5 else "#333333"
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "action": {"type": "postback", "label": str(day),
+                                   "data": f"action=select_date&date={date_str}"},
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": color}],
+                    })
 
-                    if is_past:
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "contents": [{"type": "text", "text": str(day), "size": "sm",
-                                          "align": "center", "color": "#DDDDDD"}],
-                        })
-                    elif closed:
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "action": {"type": "postback", "label": "定休日",
-                                       "data": "action=closed_day"},
-                            "contents": [{"type": "text", "text": str(day), "size": "sm",
-                                          "align": "center", "color": "#CCCCCC",
-                                          "decoration": "line-through"}],
-                        })
-                    else:
-                        day_color = BRAND_COLOR if i == 6 else "#1565c0" if i == 5 else "#111111"
-                        is_today = d == today_date
-                        cell_contents = [
-                            {"type": "text", "text": str(day), "size": "sm",
-                             "align": "center", "color": day_color,
-                             "weight": "bold" if is_today else "regular"}
-                        ]
-                        if is_today:
-                            cell_contents.append(
-                                {"type": "text", "text": "●", "size": "xxs",
-                                 "align": "center", "color": BRAND_COLOR}
-                            )
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "action": {"type": "postback", "label": date_str,
-                                       "data": f"action=select_date&date={date_str}"},
-                            "contents": cell_contents,
-                        })
+        rows.append({
+            "type": "box", "layout": "horizontal",
+            "contents": row_contents, "margin": "md",
+        })
 
-            rows.append({
-                "type": "box", "layout": "horizontal", "margin": "sm",
-                "contents": row_contents,
-            })
+    return {
+        "type": "bubble", "size": "giga",
+        "body": {
+            "type": "box", "layout": "vertical",
+            "contents": rows, "paddingAll": "xl",
+        },
+    }
 
-        bubble = {
+
+def build_time_flex(available_slots):
+    if not available_slots:
+        return {
             "type": "bubble",
-            "body": {"type": "box", "layout": "vertical", "contents": rows, "paddingAll": "12px"},
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "😢 空き枠なし", "weight": "bold", "size": "lg"},
+                    {"type": "text", "text": "この日は満席です。別の日をお選びください。",
+                     "size": "sm", "color": "#666666", "margin": "md", "wrap": True},
+                ],
+            },
+            "footer": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "button", "action": {"type": "postback", "label": "別の日を選ぶ",
+                     "data": "action=reselect_date"}, "style": "primary", "color": "#E05241"}
+                ],
+            },
         }
-        bubbles.append(bubble)
-
-    return {"type": "carousel", "contents": bubbles}
-
-
-def build_time_flex(slots):
     buttons = []
-    for slot in slots:
-        label = f"🕐 {slot['time']}"
+    for slot in available_slots[:12]:
         buttons.append({
             "type": "button",
-            "action": {"type": "postback", "label": label,
+            "action": {"type": "postback",
+                       "label": f"{slot['time']}〜（残{slot['available']}席）",
                        "data": f"action=select_time&time={slot['time']}"},
             "style": "secondary", "height": "sm", "margin": "sm",
         })
-
-    rows = []
-    for i in range(0, len(buttons), 2):
-        rows.append({"type": "box", "layout": "horizontal",
-                      "contents": buttons[i:i+2], "spacing": "sm"})
-
     return {
         "type": "bubble",
         "body": {
             "type": "box", "layout": "vertical",
             "contents": [
                 {"type": "text", "text": "🕐 時間を選択", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "ご希望の時間をお選びください",
+                {"type": "text", "text": "ご希望の時間帯をお選びください",
                  "size": "sm", "color": "#666666", "margin": "md"},
                 {"type": "separator", "margin": "lg"},
-                *rows,
+                *buttons,
             ],
         },
+    }
+
+
+def _detail_row(label, value, bold=False):
+    return {
+        "type": "box", "layout": "horizontal",
+        "contents": [
+            {"type": "text", "text": label, "size": "sm", "color": "#999999", "flex": 2},
+            {"type": "text", "text": value, "size": "sm",
+             "weight": "bold" if bold else "regular",
+             "color": "#E05241" if bold else "#333333", "flex": 3, "wrap": True},
+        ],
     }
 
 
 def build_confirm_flex(session):
-    menu = next((m for m in MENU_ITEMS if m["id"] == session["menu_id"]), None)
-    staff_name = session.get("staff_name") or "指名なし（自動割り当て）"
-
+    menu = next((m for m in MENU_ITEMS if m["id"] == session["menu"]), None)
+    total = menu["price"] * session["guests"]
+    date_obj = datetime.datetime.strptime(session["date"], "%Y-%m-%d")
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    date_display = f"{date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
     return {
         "type": "bubble",
-        "header": {
-            "type": "box", "layout": "vertical",
-            "contents": [
-                {"type": "text", "text": "📋 ご予約内容の確認", "weight": "bold",
-                 "size": "lg", "color": "#FFFFFF"},
-            ],
-            "backgroundColor": BRAND_COLOR, "paddingAll": "15px",
-        },
         "body": {
             "type": "box", "layout": "vertical",
             "contents": [
-                {"type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "施術", "size": "sm", "color": "#888888", "flex": 2},
-                    {"type": "text", "text": menu["name"] if menu else "", "size": "sm",
-                     "weight": "bold", "flex": 3, "wrap": True},
-                ]},
-                {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
-                    {"type": "text", "text": "担当", "size": "sm", "color": "#888888", "flex": 2},
-                    {"type": "text", "text": staff_name, "size": "sm",
-                     "weight": "bold", "flex": 3, "wrap": True},
-                ]},
-                {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
-                    {"type": "text", "text": "日付", "size": "sm", "color": "#888888", "flex": 2},
-                    {"type": "text", "text": session["date"], "size": "sm",
-                     "weight": "bold", "flex": 3},
-                ]},
-                {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
-                    {"type": "text", "text": "時間", "size": "sm", "color": "#888888", "flex": 2},
-                    {"type": "text", "text": session["time"], "size": "sm",
-                     "weight": "bold", "flex": 3},
-                ]},
-                {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
-                    {"type": "text", "text": "料金", "size": "sm", "color": "#888888", "flex": 2},
-                    {"type": "text", "text": f"¥{menu['price']:,}" if menu else "",
-                     "size": "sm", "weight": "bold", "flex": 3, "color": BRAND_COLOR},
-                ]},
+                {"type": "text", "text": "📋 予約内容の確認", "weight": "bold", "size": "lg"},
                 {"type": "separator", "margin": "lg"},
-                {"type": "text", "text": "お名前とお電話番号をメッセージで送ってください",
-                 "size": "xs", "color": "#999999", "margin": "lg", "wrap": True},
-                {"type": "text", "text": "例: 山田太郎 090-1234-5678",
-                 "size": "xs", "color": BRAND_COLOR, "margin": "sm"},
+                {"type": "box", "layout": "vertical", "margin": "lg", "spacing": "md",
+                 "contents": [
+                    _detail_row("コース", f"{menu['emoji']} {menu['name']}"),
+                    _detail_row("人数", f"{session['guests']}名"),
+                    _detail_row("日付", date_display),
+                    _detail_row("時間", f"{session['time']}〜"),
+                    _detail_row("お名前", session.get("name", "未設定")),
+                    _detail_row("電話番号", session.get("phone", "未設定")),
+                    {"type": "separator", "margin": "lg"},
+                    _detail_row("合計金額", f"¥{total:,}", bold=True),
+                ]},
+            ],
+        },
+        "footer": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                {"type": "button", "action": {"type": "postback", "label": "✅ 予約を確定する",
+                 "data": "action=confirm_reservation"}, "style": "primary", "color": "#E05241"},
+                {"type": "button", "action": {"type": "postback", "label": "❌ キャンセル",
+                 "data": "action=cancel_flow"}, "style": "secondary", "margin": "sm"},
             ],
         },
     }
 
 
-def build_reservation_list_flex(reservations):
-    if not reservations:
-        return {
-            "type": "bubble",
-            "body": {
-                "type": "box", "layout": "vertical",
-                "contents": [
-                    {"type": "text", "text": "📋 予約一覧", "weight": "bold", "size": "lg"},
-                    {"type": "text", "text": "現在、ご予約はありません。",
-                     "size": "sm", "color": "#666666", "margin": "md"},
-                ],
-            },
-        }
-
-    bubbles = []
-    for r in reservations[:5]:
-        staff_text = r.get("staff_name") or "指名なし"
-        bubble = {
-            "type": "bubble", "size": "kilo",
-            "body": {
-                "type": "box", "layout": "vertical",
-                "contents": [
-                    {"type": "text", "text": f"📅 {r['reservation_date']}",
-                     "weight": "bold", "size": "md"},
-                    {"type": "text", "text": f"🕐 {r['reservation_time']}〜",
-                     "size": "sm", "margin": "sm"},
-                    {"type": "text", "text": f"✂️ {r['menu_name']}",
-                     "size": "sm", "margin": "sm", "wrap": True},
-                    {"type": "text", "text": f"👤 担当: {staff_text}",
-                     "size": "sm", "margin": "sm"},
-                ],
-            },
-        }
-        bubbles.append(bubble)
-    return {"type": "carousel", "contents": bubbles}
+def build_complete_flex(reservation):
+    menu = next((m for m in MENU_ITEMS if m["id"] == reservation["menu_id"]), None)
+    date_obj = datetime.datetime.strptime(reservation["reservation_date"], "%Y-%m-%d")
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    date_display = f"{date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
+    return {
+        "type": "bubble",
+        "body": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "🎉", "size": "3xl", "align": "center"},
+                {"type": "text", "text": "予約が完了しました！", "weight": "bold",
+                 "size": "lg", "align": "center", "margin": "md"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "box", "layout": "vertical", "margin": "lg", "spacing": "md",
+                 "contents": [
+                    _detail_row("コース", menu["name"] if menu else ""),
+                    _detail_row("日時", f"{date_display} {reservation['reservation_time']}〜"),
+                    _detail_row("人数", f"{reservation['guests']}名"),
+                    _detail_row("予約番号", f"#{reservation['id']}"),
+                ]},
+                {"type": "text", "text": "前日にリマインドをお送りします。\nご来店をお待ちしております！",
+                 "size": "xs", "color": "#999999", "margin": "xl", "wrap": True, "align": "center"},
+            ],
+        },
+    }
 
 
 def build_cancel_list_flex(reservations):
+    """キャンセル対象の予約一覧"""
     if not reservations:
         return {
             "type": "bubble",
             "body": {
                 "type": "box", "layout": "vertical",
                 "contents": [
-                    {"type": "text", "text": "❌ キャンセル", "weight": "bold", "size": "lg"},
-                    {"type": "text", "text": "キャンセルできる予約はありません。",
-                     "size": "sm", "color": "#666666", "margin": "md"},
+                    {"type": "text", "text": "現在、予約はありません。",
+                     "size": "sm", "color": "#666666", "wrap": True},
                 ],
             },
         }
-
-    bubbles = []
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    buttons = []
     for r in reservations[:5]:
-        staff_text = r.get("staff_name") or "指名なし"
-        bubble = {
-            "type": "bubble", "size": "kilo",
-            "body": {
-                "type": "box", "layout": "vertical",
-                "contents": [
-                    {"type": "text", "text": f"📅 {r['reservation_date']}",
-                     "weight": "bold", "size": "md"},
-                    {"type": "text", "text": f"🕐 {r['reservation_time']}〜",
-                     "size": "sm", "margin": "sm"},
-                    {"type": "text", "text": f"✂️ {r['menu_name']}",
-                     "size": "sm", "margin": "sm", "wrap": True},
-                    {"type": "text", "text": f"👤 担当: {staff_text}",
-                     "size": "sm", "margin": "sm"},
-                ],
-            },
-            "footer": {
-                "type": "box", "layout": "vertical",
-                "contents": [
-                    {"type": "button", "action": {"type": "postback",
-                     "label": "この予約をキャンセル",
-                     "data": f"action=confirm_cancel&reservation_id={r['id']}"},
-                     "style": "primary", "color": "#FF4444", "height": "sm"}
-                ],
-            },
-        }
-        bubbles.append(bubble)
-    return {"type": "carousel", "contents": bubbles}
+        date_obj = datetime.datetime.strptime(r["reservation_date"], "%Y-%m-%d")
+        wd = weekday_jp[date_obj.weekday()]
+        label = f"{date_obj.month}/{date_obj.day}({wd}) {r['reservation_time']}〜 {r['menu_name']}"
+        # ラベルは最大40文字
+        if len(label) > 40:
+            label = label[:37] + "..."
+        buttons.append({
+            "type": "button",
+            "action": {"type": "postback", "label": label,
+                       "data": f"action=cancel_confirm&rid={r['id']}"},
+            "style": "secondary", "height": "sm", "margin": "sm",
+        })
+    return {
+        "type": "bubble",
+        "body": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "❌ キャンセルする予約を選択",
+                 "weight": "bold", "size": "md"},
+                {"type": "separator", "margin": "lg"},
+                *buttons,
+            ],
+        },
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LINE送信ヘルパー
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def reply_flex(reply_token, alt_text, flex_content):
+    line_bot_api.reply_message(reply_token,
+        FlexSendMessage(alt_text=alt_text, contents=flex_content))
+
+def reply_text(reply_token, text):
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
+
+def push_text(user_id, text):
+    line_bot_api.push_message(user_id, TextSendMessage(text=text))
+
+def push_flex(user_id, alt_text, flex_content):
+    line_bot_api.push_message(user_id,
+        FlexSendMessage(alt_text=alt_text, contents=flex_content))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1034,18 +1024,18 @@ def terms_of_service():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LINE Webhook
+# Webhookエンドポイント
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+    logger.info(f"Webhook受信: {body[:200]}")
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
     return "OK"
-
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -1059,291 +1049,434 @@ def health():
     return jsonify(status), 200
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# イベントハンドラ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @handler.add(FollowEvent)
 def handle_follow(event):
-    uid = event.source.user_id
-    try:
-        profile = line_bot_api.get_profile(uid)
-        db_get_or_create_customer(uid, profile.display_name)
-    except Exception:
-        db_get_or_create_customer(uid)
-
-    line_bot_api.reply_message(
-        event.reply_token,
-        FlexSendMessage(alt_text="ようこそ！", contents=build_welcome_flex()),
-    )
+    user_id = event.source.user_id
+    db_get_or_create_customer(user_id)
+    reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
 
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    uid = event.source.user_id
+    user_id = event.source.user_id
     text = event.message.text.strip()
 
-    # 名前入力待ち状態
-    session = session_get(uid)
-    if session and session.get("step") == "awaiting_name":
-        parts = text.split()
-        if len(parts) >= 2:
-            name = parts[0]
-            phone = parts[1]
-        else:
-            name = text
-            phone = ""
-
-        # バリデーション
-        valid_name, name = validate_name(name)
-        if not valid_name:
-            line_bot_api.reply_message(event.reply_token,
-                TextSendMessage(text="⚠️ お名前を正しく入力してください（50文字以内）"))
-            return
-        if phone:
-            valid_phone, cleaned_phone = validate_phone(phone)
-            if not valid_phone:
-                line_bot_api.reply_message(event.reply_token,
-                    TextSendMessage(text="⚠️ 電話番号の形式が正しくありません。\nお名前と電話番号をスペース区切りで再入力してください。\n例: 山田太郎 090-1234-5678"))
+    session = session_get(user_id)
+    if session:
+        if session["step"] == "name":
+            valid, sanitized_name = validate_name(text)
+            if not valid:
+                reply_text(event.reply_token, "⚠️ お名前を正しく入力してください（50文字以内）")
                 return
-            phone = cleaned_phone
-
-        menu = next((m for m in MENU_ITEMS if m["id"] == session["menu_id"]), None)
-        if not menu:
-            line_bot_api.reply_message(event.reply_token,
-                                       TextSendMessage(text="エラーが発生しました。もう一度「予約」と送ってください。"))
-            session_delete(uid)
+            session_update(user_id, {"name": sanitized_name, "step": "phone"})
+            reply_text(event.reply_token, "📱 お電話番号を入力してください（例: 090-1234-5678）")
+            return
+        elif session["step"] == "phone":
+            valid, cleaned_phone = validate_phone(text)
+            if not valid:
+                reply_text(event.reply_token, "⚠️ 電話番号の形式が正しくありません。\n例: 090-1234-5678")
+                return
+            session_update(user_id, {"phone": cleaned_phone or text, "step": "confirm"})
+            session["phone"] = cleaned_phone or text
+            session["step"] = "confirm"
+            reply_flex(event.reply_token, "予約内容の確認", build_confirm_flex(session))
             return
 
-        # 指名なしの場合、スタッフを自動割り当て
-        staff_id = session.get("staff_id", 0)
-        staff_name = session.get("staff_name")
-        if staff_id == 0:
-            slots = get_available_slots(session["date"], 0, menu["duration"])
-            target_slot = next((s for s in slots if s["time"] == session["time"]), None)
-            if target_slot and target_slot.get("available_staff_ids"):
-                assigned_id = auto_assign_staff(
-                    session["date"], session["time"], menu["duration"],
-                    target_slot["available_staff_ids"]
-                )
-                staff_id = assigned_id
-                assigned_staff = next((s for s in db_get_active_staff() if s["id"] == assigned_id), None)
-                staff_name = assigned_staff["name"] if assigned_staff else None
-
-        reservation_data = {
-            "line_user_id": uid,
-            "guest_name": name,
-            "phone": phone,
-            "menu_id": session["menu_id"],
-            "menu_name": menu["name"],
-            "staff_id": staff_id if staff_id != 0 else None,
-            "staff_name": staff_name,
-            "reservation_date": session["date"],
-            "reservation_time": session["time"],
-            "duration_minutes": menu["duration"],
-            "total_price": menu["price"],
-        }
-
-        # 顧客情報更新
-        customer = db_get_or_create_customer(uid, name)
-        if customer:
-            reservation_data["customer_id"] = customer["id"]
-        db_update_customer_visit(uid, name, phone)
-
-        saved = db_save_reservation(reservation_data)
-        if saved:
-            event_id = create_calendar_event(reservation_data)
-            if event_id and saved.get("id"):
-                supabase_patch("reservations", {"calendar_event_id": event_id},
-                               {"id": f"eq.{saved['id']}"})
-
-            staff_display = staff_name or "自動割り当て"
-            confirm_text = (
-                f"✅ ご予約が確定しました！\n\n"
-                f"📅 {session['date']}\n"
-                f"🕐 {session['time']}〜\n"
-                f"✂️ {menu['name']}\n"
-                f"👤 担当: {staff_display}\n"
-                f"💰 ¥{menu['price']:,}\n"
-                f"👤 {name} 様\n\n"
-                f"ご来店お待ちしております！"
-            )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=confirm_text))
-
-            # オーナー通知
-            if OWNER_LINE_USER_ID:
-                try:
-                    owner_text = (
-                        f"🔔 新規予約\n"
-                        f"{session['date']} {session['time']}\n"
-                        f"{menu['name']} / 担当:{staff_display}\n"
-                        f"{name} 様 {phone}"
-                    )
-                    line_bot_api.push_message(OWNER_LINE_USER_ID, TextSendMessage(text=owner_text))
-                except Exception:
-                    pass
-        else:
-            line_bot_api.reply_message(event.reply_token,
-                                       TextSendMessage(text="予約の保存に失敗しました。もう一度お試しください。"))
-
-        session_delete(uid)
+    # --- オーナー用: 電話予約クイック登録 ---
+    if user_id == OWNER_LINE_USER_ID and text in ["電話予約", "電話予約登録"]:
+        session_set(user_id, {"step": "phone_reg_name", "user_id": user_id, "is_phone_reg": True})
+        reply_text(event.reply_token, "📞 電話予約登録モード\n\nお客様のお名前を入力してください")
         return
 
-    # キーワードで予約フロー開始
-    if any(kw in text for kw in ["予約", "よやく", "メニュー"]):
-        session_delete(uid)
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="メニュー選択", contents=build_menu_flex()),
-        )
-    elif any(kw in text for kw in ["確認", "かくにん"]):
-        reservations = db_get_user_reservations(uid)
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="予約一覧", contents=build_reservation_list_flex(reservations)),
-        )
-    elif any(kw in text for kw in ["キャンセル", "きゃんせる", "取消"]):
-        reservations = db_get_user_reservations(uid)
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="キャンセル", contents=build_cancel_list_flex(reservations)),
-        )
+    if session and session.get("is_phone_reg"):
+        step = session["step"]
+        if step == "phone_reg_name":
+            valid, sanitized_name = validate_name(text)
+            if not valid:
+                reply_text(event.reply_token, "⚠️ お名前を正しく入力してください（50文字以内）")
+                return
+            session_update(user_id, {"phone_reg_name": sanitized_name, "step": "phone_reg_guests"})
+            reply_text(event.reply_token, f"👤 {sanitized_name} 様\n\n👥 人数を入力してください（例: 3）")
+            return
+        elif step == "phone_reg_guests":
+            valid, guest_count = validate_positive_int(text, max_val=MAX_SEATS)
+            if not valid:
+                reply_text(event.reply_token, f"⚠️ 1〜{MAX_SEATS}の数字を入力してください")
+                return
+            session_update(user_id, {"phone_reg_guests": guest_count, "step": "phone_reg_date"})
+            reply_text(event.reply_token, f"👥 {guest_count}名\n\n📅 日付を入力してください（例: 5/25 または 2026-05-25）")
+            return
+        elif step == "phone_reg_date":
+            # 柔軟な日付パース
+            date_str = None
+            today = datetime.datetime.now(JST)
+            text_clean = text.strip()
+            # YYYY-MM-DD形式
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", text_clean):
+                date_str = text_clean
+            # M/D形式
+            elif re.match(r"^\d{1,2}/\d{1,2}$", text_clean):
+                parts = text_clean.split("/")
+                m, d = int(parts[0]), int(parts[1])
+                year = today.year
+                candidate = datetime.date(year, m, d)
+                if candidate < today.date():
+                    candidate = datetime.date(year + 1, m, d)
+                date_str = candidate.strftime("%Y-%m-%d")
+            if not date_str:
+                reply_text(event.reply_token, "⚠️ 日付の形式が正しくありません\n例: 5/25 または 2026-05-25")
+                return
+            if db_is_closed_day(date_str):
+                reply_text(event.reply_token, "🚫 その日は定休日です。別の日を入力してください。")
+                return
+            session_update(user_id, {"phone_reg_date": date_str, "step": "phone_reg_time"})
+            reply_text(event.reply_token, f"📅 {date_str}\n\n🕐 時間を入力してください（例: 18:30）")
+            return
+        elif step == "phone_reg_time":
+            time_match = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+            if not time_match:
+                reply_text(event.reply_token, "⚠️ 時間の形式が正しくありません\n例: 18:30")
+                return
+            h, m = int(time_match.group(1)), int(time_match.group(2))
+            if h < 0 or h > 23 or m < 0 or m > 59:
+                reply_text(event.reply_token, "⚠️ 正しい時刻を入力してください")
+                return
+            time_str = f"{h:02d}:{m:02d}"
+            session_update(user_id, {"phone_reg_time": time_str, "step": "phone_reg_phone"})
+            reply_text(event.reply_token, f"🕐 {time_str}\n\n📱 お客様の電話番号を入力（不明なら「なし」と入力）")
+            return
+        elif step == "phone_reg_phone":
+            phone = ""
+            if text.strip() not in ["なし", "ナシ", "無し", "不明", "-", "ー"]:
+                valid, cleaned = validate_phone(text)
+                if not valid:
+                    reply_text(event.reply_token, "⚠️ 電話番号の形式が正しくありません\n不明なら「なし」と入力してください")
+                    return
+                phone = cleaned or text.strip()
+            session_update(user_id, {"phone_reg_phone": phone, "step": "phone_reg_memo"})
+            reply_text(event.reply_token, "📝 メモがあれば入力（なければ「なし」）\n例: 窓際希望、アレルギーあり")
+            return
+        elif step == "phone_reg_memo":
+            memo = "" if text.strip() in ["なし", "ナシ", "無し", "-", "ー"] else sanitize_text(text, max_length=200)
+            session = session_get(user_id)
+            # 予約確定
+            menu = MENU_ITEMS[0]  # 電話予約はデフォルト「席のみ」
+            reservation_data = {
+                "line_user_id": "phone_reservation",
+                "guest_name": session.get("phone_reg_name", ""),
+                "phone": session.get("phone_reg_phone", ""),
+                "menu_id": menu["id"],
+                "menu_name": menu["name"],
+                "guests": session.get("phone_reg_guests", 1),
+                "reservation_date": session.get("phone_reg_date", ""),
+                "reservation_time": session.get("phone_reg_time", ""),
+                "duration_minutes": menu["duration"],
+                "total_price": 0,
+                "status": "confirmed",
+                "source": "phone",
+                "memo": memo,
+            }
+            cal_event_id = create_calendar_event(reservation_data)
+            reservation_data["calendar_event_id"] = cal_event_id
+            saved = db_save_reservation(reservation_data)
+            session_delete(user_id)
+            if saved:
+                d = datetime.datetime.strptime(reservation_data["reservation_date"], "%Y-%m-%d")
+                wd = ["月","火","水","木","金","土","日"][d.weekday()]
+                memo_line = f"\n📝 {memo}" if memo else ""
+                reply_text(event.reply_token,
+                    f"✅ 電話予約を登録しました！\n\n"
+                    f"👤 {reservation_data['guest_name']} 様\n"
+                    f"📅 {d.month}/{d.day}（{wd}） {reservation_data['reservation_time']}〜\n"
+                    f"👥 {reservation_data['guests']}名\n"
+                    f"📱 {reservation_data.get('phone') or '未設定'}"
+                    f"{memo_line}\n\n"
+                    f"🔖 予約番号: #{saved['id']}")
+            else:
+                reply_text(event.reply_token, "❌ 予約の保存に失敗しました。もう一度お試しください。")
+            return
+
+    if text in ["予約", "予約する", "予約したい"]:
+        reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
+    elif text in ["メニュー", "コース"]:
+        session_set(user_id, {"step": "menu"})
+        reply_flex(event.reply_token, "メニュー選択", build_menu_flex())
+    elif text in ["確認", "予約確認"]:
+        handle_check_reservation(event.reply_token, user_id)
+    elif text in ["キャンセル", "取消"]:
+        session_delete(user_id)
+        handle_list_cancel(event.reply_token, user_id)
     else:
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text=f"{STORE_NAME}へようこそ", contents=build_welcome_flex()),
-        )
+        #reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
+        return
 
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    uid = event.source.user_id
-    data = event.postback.data
-    params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
-    action = params.get("action", "")
+    user_id = event.source.user_id
+    data = dict(x.split("=", 1) for x in event.postback.data.split("&"))
+    action = data.get("action")
 
     if action == "start_reservation":
-        session_delete(uid)
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="メニュー選択", contents=build_menu_flex()),
-        )
+        session_set(user_id, {"step": "menu", "user_id": user_id})
+        reply_flex(event.reply_token, "メニュー選択", build_menu_flex())
 
     elif action == "select_menu":
-        menu_id = params.get("menu_id")
-        menu = next((m for m in MENU_ITEMS if m["id"] == menu_id), None)
-        if not menu:
+        session = session_get(user_id) or {"user_id": user_id}
+        session["menu"] = data["menu_id"]
+        session["step"] = "guests"
+        session_set(user_id, session)
+        reply_flex(event.reply_token, "人数選択", build_guests_flex())
+
+    elif action == "select_guests":
+        valid, guest_count = validate_positive_int(data.get("guests", 0), max_val=MAX_SEATS)
+        if not valid:
+            reply_text(event.reply_token, "⚠️ 人数が正しくありません。もう一度お試しください。")
             return
-        session_set(uid, {"menu_id": menu_id, "step": "staff"})
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="スタッフ選択", contents=build_staff_flex()),
-        )
+        session = session_get(user_id) or {}
+        session["guests"] = guest_count
+        session["step"] = "date"
+        session_set(user_id, session)
+        reply_text(event.reply_token, "📅 カレンダーを準備しています...\n少々お待ちください")
+        push_flex(user_id, "日付選択", build_date_flex())
 
-    elif action == "select_staff":
-        staff_id = int(params.get("staff_id", 0))
-        session = session_get(uid)
-        if not session:
-            return
-        staff_name = None
-        if staff_id != 0:
-            staff_list = db_get_active_staff()
-            staff = next((s for s in staff_list if s["id"] == staff_id), None)
-            staff_name = staff["name"] if staff else None
-        session_update(uid, {"staff_id": staff_id, "staff_name": staff_name, "step": "date"})
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="日付選択", contents=build_date_flex()),
-        )
-
-    elif action == "select_date":
-        date_str = params.get("date")
-        session = session_get(uid)
-        if not session:
-            return
-        menu = next((m for m in MENU_ITEMS if m["id"] == session["menu_id"]), None)
-        if not menu:
-            return
-
-        staff_id = session.get("staff_id", 0)
-        slots = get_available_slots(date_str, staff_id, menu["duration"])
-
-        if not slots:
-            staff_text = session.get("staff_name") or "指名なし"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"申し訳ございません。{date_str}は{staff_text}の空きがありません。\n別の日付をお選びください。"),
-            )
-            session_update(uid, {"step": "date"})
-            return
-
-        session_update(uid, {"date": date_str, "step": "time"})
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="時間選択", contents=build_time_flex(slots)),
-        )
-
-    elif action == "select_time":
-        time_str = params.get("time")
-        session = session_get(uid)
-        if not session:
-            return
-        session_update(uid, {"time": time_str, "step": "awaiting_name"})
-        # 更新後のセッションで確認画面を構築
-        session["time"] = time_str
-        session["step"] = "awaiting_name"
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="予約確認", contents=build_confirm_flex(session)),
-        )
+    elif action == "calendar_nav":
+        offset = int(data.get("offset", 0))
+        reply_flex(event.reply_token, "日付選択", build_date_flex(month_offset=offset))
 
     elif action == "closed_day":
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="申し訳ございません、その日は定休日です。\n別の日付をお選びください。"),
-        )
+        reply_text(event.reply_token, "🚫 その日は定休日です。別の日をお選びください。")
+
+    elif action == "select_date" or action == "reselect_date":
+        session = session_get(user_id) or {}
+
+        if action == "reselect_date":
+            reply_flex(event.reply_token, "日付選択", build_date_flex())
+            return
+
+        # 日付を取得
+        selected_date = data.get("date")
+        if not selected_date:
+            reply_text(event.reply_token, "日付の取得に失敗しました。もう一度お試しください。")
+            return
+
+        # 定休日チェック（カレンダー選択後に判定）
+        if db_is_closed_day(selected_date):
+            reply_text(event.reply_token, "🚫 申し訳ありません、その日は定休日です。\n別の日をお選びください。")
+            push_flex(user_id, "日付選択", build_date_flex())
+            return
+
+        session["date"] = selected_date
+        session["step"] = "time"
+        session_set(user_id, session)
+
+        reply_text(event.reply_token, "🔍 空き状況を確認しています...\n少々お待ちください")
+        menu = next((m for m in MENU_ITEMS if m["id"] == session.get("menu")), None)
+        duration = menu["duration"] if menu else 60
+        slots = get_available_slots(session["date"], session["guests"], duration)
+        push_flex(user_id, "時間選択", build_time_flex(slots))
+
+    elif action == "select_time":
+        session = session_get(user_id) or {}
+        session["time"] = data["time"]
+        session["step"] = "name"
+        session_set(user_id, session)
+        reply_text(event.reply_token, "✏️ ご予約のお名前を入力してください")
+
+    elif action == "confirm_reservation":
+        session = session_get(user_id)
+        if not session:
+            reply_text(event.reply_token, "セッションが切れました。「予約」と送信してやり直してください。")
+            return
+
+        menu = next((m for m in MENU_ITEMS if m["id"] == session["menu"]), None)
+        if not menu:
+            reply_text(event.reply_token, "メニュー情報の取得に失敗しました。やり直してください。")
+            return
+
+        # DB保存用データ
+        reservation_data = {
+            "line_user_id": user_id,
+            "guest_name": session.get("name", "未設定"),
+            "phone": session.get("phone", ""),
+            "menu_id": session["menu"],
+            "menu_name": menu["name"],
+            "guests": session["guests"],
+            "reservation_date": session["date"],
+            "reservation_time": session["time"],
+            "duration_minutes": menu["duration"],
+            "total_price": menu["price"] * session["guests"],
+            "status": "confirmed",
+        }
+
+        # Googleカレンダーに登録
+        cal_event_id = create_calendar_event(reservation_data)
+        reservation_data["calendar_event_id"] = cal_event_id
+
+        # DBに保存
+        saved = db_save_reservation(reservation_data)
+        if not saved:
+            reply_text(event.reply_token, "予約の保存に失敗しました。もう一度お試しください。")
+            return
+
+        # 顧客情報を更新
+        db_update_customer_visit(user_id, session.get("name"), session.get("phone"))
+
+        # 完了メッセージ
+        reply_flex(event.reply_token, "予約完了", build_complete_flex(saved))
+
+        # オーナー通知
+        notify_owner(saved)
+
+        # セッションクリア
+        session_delete(user_id)
+
+    elif action == "cancel_flow":
+        session_delete(user_id)
+        reply_text(event.reply_token, "予約フローをキャンセルしました。\n「予約」と送信するとやり直せます。")
 
     elif action == "check_reservation":
-        reservations = db_get_user_reservations(uid)
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="予約一覧", contents=build_reservation_list_flex(reservations)),
-        )
+        handle_check_reservation(event.reply_token, user_id)
 
     elif action == "list_cancel":
-        reservations = db_get_user_reservations(uid)
-        line_bot_api.reply_message(
-            event.reply_token,
-            FlexSendMessage(alt_text="キャンセル", contents=build_cancel_list_flex(reservations)),
-        )
+        handle_list_cancel(event.reply_token, user_id)
 
-    elif action == "confirm_cancel":
-        reservation_id = params.get("reservation_id")
+    elif action == "cancel_confirm":
+        rid = int(data["rid"])
+        reply_flex(event.reply_token, "キャンセル確認", {
+            "type": "bubble",
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "本当にキャンセルしますか？",
+                     "weight": "bold", "size": "md", "wrap": True},
+                    {"type": "text", "text": "キャンセルすると元に戻せません。",
+                     "size": "sm", "color": "#999999", "margin": "md"},
+                ],
+            },
+            "footer": {
+                "type": "box", "layout": "horizontal", "spacing": "sm",
+                "contents": [
+                    {"type": "button", "action": {"type": "postback", "label": "はい、キャンセル",
+                     "data": f"action=cancel_execute&rid={rid}"},
+                     "style": "primary", "color": "#E05241", "height": "sm"},
+                    {"type": "button", "action": {"type": "postback", "label": "戻る",
+                     "data": "action=list_cancel"},
+                     "style": "secondary", "height": "sm"},
+                ],
+            },
+        })
+
+    elif action == "cancel_execute":
+        rid = int(data["rid"])
+
+        # カレンダーからも削除
         try:
-            rows = supabase_get("reservations", {
-                "select": "*", "id": f"eq.{reservation_id}",
-                "line_user_id": f"eq.{uid}",
-            })
+            rows = supabase_get("reservations", {"select": "*", "id": f"eq.{rid}"})
             if rows:
-                r = rows[0]
-                event_id = r.get("calendar_event_id")
-                if event_id:
-                    delete_calendar_event(event_id)
-        except Exception:
-            pass
+                delete_calendar_event(rows[0].get("calendar_event_id"))
+        except Exception as e:
+            logger.error(f"キャンセル時カレンダー削除エラー: {e}")
 
-        if db_cancel_reservation(reservation_id, uid):
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="予約をキャンセルしました。\nまたのご予約をお待ちしております。"),
-            )
+        success = db_cancel_reservation(rid, user_id)
+        if success:
+            reply_text(event.reply_token, "✅ 予約をキャンセルしました。\n「予約」と送信すると再予約できます。")
+            # オーナーにキャンセル通知
+            if OWNER_LINE_USER_ID and OWNER_LINE_USER_ID != "dummy":
+                try:
+                    push_text(OWNER_LINE_USER_ID, f"⚠️ 予約キャンセルがありました（予約番号: #{rid}）")
+                except Exception:
+                    pass
         else:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="キャンセルに失敗しました。もう一度お試しください。"),
-            )
+            reply_text(event.reply_token, "キャンセルに失敗しました。もう一度お試しください。")
+
+
+def handle_check_reservation(reply_token, user_id):
+    reservations = db_get_user_reservations(user_id)
+    if not reservations:
+        reply_text(reply_token, "現在、予約はありません。\n「予約」と送信すると予約できます。")
+        return
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    lines = ["📋 現在のご予約:\n"]
+    for r in reservations:
+        date_obj = datetime.datetime.strptime(r["reservation_date"], "%Y-%m-%d")
+        lines.append(
+            f"・{date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
+            f" {r['reservation_time']}〜\n"
+            f"  {r['menu_name']} / {r['guests']}名（#{r['id']}）"
+        )
+    reply_text(reply_token, "\n".join(lines))
+
+
+def handle_list_cancel(reply_token, user_id):
+    reservations = db_get_user_reservations(user_id)
+    reply_flex(reply_token, "キャンセル選択", build_cancel_list_flex(reservations))
+
+
+def notify_owner(reservation):
+    if not OWNER_LINE_USER_ID or OWNER_LINE_USER_ID == "dummy":
+        return
+    date_obj = datetime.datetime.strptime(reservation["reservation_date"], "%Y-%m-%d")
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    source = reservation.get("source", "line")
+    source_label = "📞電話予約" if source == "phone" else "📱LINE予約"
+    memo_line = f"\n📝 {reservation['memo']}" if reservation.get("memo") else ""
+    message = (
+        f"🔔 新しい予約が入りました！\n\n"
+        f"🏷️ {source_label}\n"
+        f"📅 {date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
+        f"{reservation['reservation_time']}〜\n"
+        f"👤 {reservation['guest_name']} 様\n"
+        f"👥 {reservation['guests']}名\n"
+        f"🍽️ {reservation['menu_name']}\n"
+        f"📱 {reservation.get('phone', '未設定')}\n"
+        f"💰 ¥{reservation.get('total_price', 0):,}\n"
+        f"🔖 予約番号: #{reservation['id']}"
+        f"{memo_line}"
+    )
+    try:
+        push_text(OWNER_LINE_USER_ID, message)
+    except Exception as e:
+        logger.error(f"オーナー通知エラー: {e}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ダッシュボード（ログイン・ログアウト）
+# 前日リマインド（DB版）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def send_reminders():
+    reminders = db_get_tomorrow_reminders()
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    for r in reminders:
+        date_obj = datetime.datetime.strptime(r["reservation_date"], "%Y-%m-%d")
+        message = (
+            f"⏰ 明日のご予約リマインド\n\n"
+            f"{STORE_NAME}より\n\n"
+            f"📅 {date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
+            f" {r['reservation_time']}〜\n"
+            f"🍽️ {r['menu_name']}\n"
+            f"👥 {r['guests']}名\n\n"
+            f"ご来店をお待ちしております！\n"
+            f"キャンセルはLINEトーク画面から可能です。"
+        )
+        try:
+            push_text(r["line_user_id"], message)
+            db_mark_reminded(r["id"])
+            logger.info(f"リマインド送信: {r['guest_name']} {r['reservation_date']}")
+        except Exception as e:
+            logger.error(f"リマインド送信エラー: {e}")
+
+
+scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
+scheduler.add_job(send_reminders, "cron", hour=18, minute=0)
+scheduler.add_job(cleanup_expired_sessions, "interval", minutes=10)
+scheduler.start()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# オーナーダッシュボード
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1355,27 +1488,486 @@ body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-
 .login h1{font-size:20px;margin-bottom:8px;color:#333}
 .login small{color:#888;font-size:13px}
 .login input{width:100%%;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:16px;margin-top:20px}
-.login input:focus{outline:none;border-color:#9B59B6}
-.login button{width:100%%;padding:12px;background:#9B59B6;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;margin-top:12px;cursor:pointer}
-.login button:hover{background:#7D3C98}
+.login input:focus{outline:none;border-color:#E05241}
+.login button{width:100%%;padding:12px;background:#E05241;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;margin-top:12px;cursor:pointer}
+.login button:hover{background:#c0392b}
 .error{color:#c62828;font-size:13px;margin-top:12px}
 </style></head><body>
 <div class="login">
-<h1>✂️ %s</h1><small>オーナーダッシュボード</small>
+<h1>🍽️ %s</h1><small>オーナーダッシュボード</small>
 <form method="POST"><input type="password" name="password" placeholder="パスワードを入力" autofocus>
 <button type="submit">ログイン</button></form>
 %s</div></body></html>"""
 
 
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{STORE_NAME}} - ダッシュボード</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333}
+.header{background:{{BRAND_COLOR}};color:#fff;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+.header h1{font-size:18px}
+.header a{color:#fff;text-decoration:none;font-size:13px;opacity:.8}
+.tabs{display:flex;background:#fff;border-bottom:1px solid #e0e0e0;overflow-x:auto}
+.tab{padding:12px 20px;font-size:14px;font-weight:600;cursor:pointer;border-bottom:3px solid transparent;white-space:nowrap;color:#666}
+.tab.active{color:{{BRAND_COLOR}};border-bottom-color:{{BRAND_COLOR}}}
+.panel{display:none;padding:16px;max-width:960px;margin:0 auto}
+.panel.active{display:block}
+.card{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h3{font-size:15px;margin-bottom:12px;color:#333}
+.form-row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.form-group{display:flex;flex-direction:column;flex:1;min-width:140px}
+.form-group label{font-size:12px;font-weight:600;color:#666;margin-bottom:4px}
+.form-group input,.form-group select,.form-group textarea{padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:{{BRAND_COLOR}}}
+.btn{padding:12px 24px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .2s}
+.btn-primary{background:{{BRAND_COLOR}};color:#fff}
+.btn-primary:hover{opacity:.85}
+.btn-secondary{background:#e0e0e0;color:#333}
+.btn-danger{background:#e74c3c;color:#fff}
+.btn-sm{padding:6px 12px;font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#f8f8f8;padding:10px 8px;text-align:left;font-weight:600;color:#666;border-bottom:2px solid #e0e0e0;white-space:nowrap}
+td{padding:10px 8px;border-bottom:1px solid #f0f0f0;vertical-align:top}
+tr:hover{background:#fafafa}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-line{background:#06c755;color:#fff}
+.badge-phone{background:#e74c3c;color:#fff}
+.badge-walk{background:#f39c12;color:#fff}
+.badge-confirmed{background:#27ae60;color:#fff}
+.badge-cancelled{background:#95a5a6;color:#fff}
+.toast{position:fixed;bottom:20px;right:20px;padding:12px 20px;border-radius:8px;color:#fff;font-size:14px;z-index:999;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+.toast-success{background:#27ae60}
+.toast-error{background:#e74c3c}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:#fff;border-radius:10px;padding:16px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.stat .num{font-size:28px;font-weight:700;color:{{BRAND_COLOR}}}
+.stat .label{font-size:12px;color:#888;margin-top:4px}
+.empty{text-align:center;padding:40px;color:#999;font-size:14px}
+@media(max-width:600px){
+  .form-row{flex-direction:column;gap:8px}
+  .form-group{min-width:100%}
+  table{font-size:12px}
+  th,td{padding:8px 4px}
+}
+</style>
+</head><body>
+<div class="header">
+  <h1>🍽️ {{STORE_NAME}}</h1>
+  <a href="/dashboard/logout">ログアウト</a>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('reservations')">📋 予約一覧</div>
+  <div class="tab" onclick="switchTab('phone')">📞 電話予約登録</div>
+  <div class="tab" onclick="switchTab('closed')">🚫 定休日</div>
+  <div class="tab" onclick="switchTab('customers')">👥 顧客</div>
+  <div class="tab" onclick="switchTab('settings')">⚙️ 設定</div>
+</div>
+
+<!-- ===== 予約一覧 ===== -->
+<div id="panel-reservations" class="panel active">
+  <div class="stat-grid" id="stats"></div>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <h3 style="margin:0">予約一覧</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select id="filter-status" onchange="loadReservations()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+          <option value="">全ステータス</option>
+          <option value="confirmed" selected>確定のみ</option>
+          <option value="cancelled">キャンセル</option>
+        </select>
+        <select id="filter-source" onchange="filterBySource()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+          <option value="">全経路</option>
+          <option value="line">LINE</option>
+          <option value="phone">電話</option>
+        </select>
+        <input type="date" id="filter-date" onchange="loadReservations()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>経路</th><th>日付</th><th>時間</th><th>お名前</th><th>人数</th><th>コース</th><th>電話番号</th><th>メモ</th><th>状態</th><th>操作</th>
+        </tr></thead>
+        <tbody id="reservation-table"></tbody>
+      </table>
+    </div>
+    <div id="reservation-empty" class="empty" style="display:none">予約がありません</div>
+  </div>
+</div>
+
+<!-- ===== 電話予約登録 ===== -->
+<div id="panel-phone" class="panel">
+  <div class="card">
+    <h3>📞 電話予約を登録</h3>
+    <p style="font-size:13px;color:#888;margin-bottom:16px">電話で受けた予約をここから登録します。空き状況は自動チェックされます。</p>
+    <form id="phone-form" onsubmit="submitPhoneReservation(event)">
+      <div class="form-row">
+        <div class="form-group">
+          <label>日付 *</label>
+          <input type="date" id="ph-date" required>
+        </div>
+        <div class="form-group">
+          <label>時間 *</label>
+          <input type="time" id="ph-time" required>
+        </div>
+        <div class="form-group">
+          <label>人数 *</label>
+          <input type="number" id="ph-guests" min="1" max="99" value="2" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>お名前 *</label>
+          <input type="text" id="ph-name" placeholder="山田太郎" required maxlength="50">
+        </div>
+        <div class="form-group">
+          <label>電話番号</label>
+          <input type="tel" id="ph-phone" placeholder="090-1234-5678">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>コース</label>
+          <select id="ph-menu"></select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:1 1 100%">
+          <label>メモ（アレルギー・席希望など）</label>
+          <textarea id="ph-memo" rows="2" maxlength="200" placeholder="例：窓際希望、卵アレルギーあり"></textarea>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary" id="ph-submit">📞 電話予約を登録</button>
+    </form>
+  </div>
+</div>
+
+<!-- ===== 定休日 ===== -->
+<div id="panel-closed" class="panel">
+  <div class="card">
+    <h3>定休日設定</h3>
+    <div class="form-row" style="margin-bottom:16px">
+      <div class="form-group">
+        <label>曜日定休</label>
+        <select id="closed-dow">
+          <option value="">選択</option>
+          <option value="0">月曜</option><option value="1">火曜</option><option value="2">水曜</option>
+          <option value="3">木曜</option><option value="4">金曜</option><option value="5">土曜</option><option value="6">日曜</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>臨時休業日</label>
+        <input type="date" id="closed-date">
+      </div>
+      <div class="form-group">
+        <label>理由</label>
+        <input type="text" id="closed-reason" placeholder="定休日" maxlength="100">
+      </div>
+      <div class="form-group" style="justify-content:flex-end">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" onclick="addClosedDay()">追加</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>種別</th><th>曜日/日付</th><th>理由</th><th>操作</th></tr></thead>
+      <tbody id="closed-table"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== 顧客 ===== -->
+<div id="panel-customers" class="panel">
+  <div class="card">
+    <h3>顧客リスト</h3>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>名前</th><th>電話番号</th><th>来店回数</th><th>登録日</th></tr></thead>
+        <tbody id="customer-table"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 設定 ===== -->
+<div id="panel-settings" class="panel">
+  <div class="card">
+    <h3>予約締切時間</h3>
+    <p style="font-size:13px;color:#888;margin-bottom:12px">予約可能な最短時間（現在時刻から何時間前まで受付か）</p>
+    <div class="form-row">
+      <div class="form-group" style="max-width:200px">
+        <input type="number" id="deadline-hours" min="0" max="24" value="2">
+      </div>
+      <div class="form-group" style="justify-content:flex-end">
+        <button class="btn btn-primary" onclick="saveDeadline()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const MENUS = %MENU_JSON%;
+const DOW_NAMES = ['月','火','水','木','金','土','日'];
+let allReservations = [];
+
+// --- タブ切り替え ---
+function switchTab(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  event.target.classList.add('active');
+  if (name === 'reservations') loadReservations();
+  if (name === 'closed') loadClosedDays();
+  if (name === 'customers') loadCustomers();
+  if (name === 'settings') loadDeadline();
+}
+
+// --- Toast通知 ---
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast toast-' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// --- API通信 ---
+async function api(url, opts) {
+  const res = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...opts});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'エラーが発生しました');
+  return data;
+}
+
+// --- 予約一覧 ---
+async function loadReservations() {
+  const dateFrom = document.getElementById('filter-date').value || new Date().toISOString().split('T')[0];
+  const status = document.getElementById('filter-status').value;
+  let url = '/api/reservations?date_from=' + dateFrom;
+  if (status) url += '&status=' + status;
+  try {
+    const res = await api(url);
+    allReservations = res.data || [];
+    filterBySource();
+    updateStats(allReservations);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function filterBySource() {
+  const source = document.getElementById('filter-source').value;
+  let filtered = allReservations;
+  if (source) filtered = allReservations.filter(r => (r.source || 'line') === source);
+  renderReservations(filtered);
+}
+
+function renderReservations(data) {
+  const tbody = document.getElementById('reservation-table');
+  const empty = document.getElementById('reservation-empty');
+  if (!data.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  tbody.innerHTML = data.map(r => {
+    const src = r.source || 'line';
+    const srcBadge = src === 'phone' ? '<span class="badge badge-phone">電話</span>'
+                   : src === 'walk_in' ? '<span class="badge badge-walk">直接</span>'
+                   : '<span class="badge badge-line">LINE</span>';
+    const statusBadge = r.status === 'confirmed' ? '<span class="badge badge-confirmed">確定</span>'
+                      : '<span class="badge badge-cancelled">取消</span>';
+    const d = new Date(r.reservation_date + 'T00:00:00');
+    const dateStr = (d.getMonth()+1) + '/' + d.getDate() + '(' + DOW_NAMES[d.getDay() === 0 ? 6 : d.getDay()-1] + ')';
+    const actions = r.status === 'confirmed'
+      ? '<button class="btn btn-danger btn-sm" onclick="cancelRes(' + r.id + ')">取消</button>'
+      : '';
+    return '<tr><td>' + srcBadge + '</td><td>' + dateStr + '</td><td>' + r.reservation_time + '</td>'
+      + '<td>' + (r.guest_name||'') + '</td><td>' + r.guests + '名</td><td>' + (r.menu_name||'') + '</td>'
+      + '<td>' + (r.phone||'-') + '</td><td style="max-width:120px;overflow:hidden;text-overflow:ellipsis">' + (r.memo||'-') + '</td>'
+      + '<td>' + statusBadge + '</td><td>' + actions + '</td></tr>';
+  }).join('');
+}
+
+function updateStats(data) {
+  const confirmed = data.filter(r => r.status === 'confirmed');
+  const today = new Date().toISOString().split('T')[0];
+  const todayCount = confirmed.filter(r => r.reservation_date === today).length;
+  const todayGuests = confirmed.filter(r => r.reservation_date === today).reduce((s,r) => s + r.guests, 0);
+  const phoneCount = confirmed.filter(r => r.source === 'phone').length;
+  const lineCount = confirmed.filter(r => (r.source||'line') === 'line').length;
+  document.getElementById('stats').innerHTML =
+    '<div class="stat"><div class="num">' + todayCount + '</div><div class="label">本日の予約</div></div>'
+    + '<div class="stat"><div class="num">' + todayGuests + '</div><div class="label">本日の来店人数</div></div>'
+    + '<div class="stat"><div class="num">' + lineCount + '</div><div class="label">LINE予約</div></div>'
+    + '<div class="stat"><div class="num">' + phoneCount + '</div><div class="label">電話予約</div></div>';
+}
+
+async function cancelRes(rid) {
+  if (!confirm('この予約をキャンセルしますか？')) return;
+  try {
+    await api('/api/reservations/' + rid + '/cancel', {method:'POST'});
+    toast('予約をキャンセルしました', 'success');
+    loadReservations();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 電話予約登録 ---
+function initPhoneForm() {
+  const sel = document.getElementById('ph-menu');
+  sel.innerHTML = MENUS.map(m => '<option value="' + m.id + '">' + m.emoji + ' ' + m.name + ' (¥' + m.price.toLocaleString() + ')</option>').join('');
+  document.getElementById('ph-date').value = new Date().toISOString().split('T')[0];
+}
+
+async function submitPhoneReservation(e) {
+  e.preventDefault();
+  const btn = document.getElementById('ph-submit');
+  btn.disabled = true; btn.textContent = '登録中...';
+  const time = document.getElementById('ph-time').value;
+  const body = {
+    reservation_date: document.getElementById('ph-date').value,
+    reservation_time: time.length === 5 ? time : time.slice(0,5),
+    guests: parseInt(document.getElementById('ph-guests').value),
+    guest_name: document.getElementById('ph-name').value,
+    phone: document.getElementById('ph-phone').value,
+    menu_id: document.getElementById('ph-menu').value,
+    memo: document.getElementById('ph-memo').value,
+  };
+  try {
+    await api('/api/reservations/phone', {method:'POST', body:JSON.stringify(body)});
+    toast('電話予約を登録しました！', 'success');
+    document.getElementById('phone-form').reset();
+    document.getElementById('ph-date').value = new Date().toISOString().split('T')[0];
+    document.getElementById('ph-guests').value = 2;
+  } catch(e) { toast(e.message, 'error'); }
+  btn.disabled = false; btn.textContent = '📞 電話予約を登録';
+}
+
+// --- 定休日 ---
+async function loadClosedDays() {
+  try {
+    const res = await api('/api/closed-days');
+    const tbody = document.getElementById('closed-table');
+    tbody.innerHTML = (res.data||[]).map(c => {
+      const type = c.is_recurring ? '毎週' : '臨時';
+      const detail = c.day_of_week !== null ? DOW_NAMES[c.day_of_week] + '曜日' : c.closed_date || '-';
+      return '<tr><td>' + type + '</td><td>' + detail + '</td><td>' + (c.reason||'') + '</td>'
+        + '<td><button class="btn btn-danger btn-sm" onclick="deleteClosedDay(' + c.id + ')">削除</button></td></tr>';
+    }).join('');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function addClosedDay() {
+  const dow = document.getElementById('closed-dow').value;
+  const date = document.getElementById('closed-date').value;
+  const reason = document.getElementById('closed-reason').value || '定休日';
+  const body = {reason};
+  if (dow !== '') { body.day_of_week = parseInt(dow); body.is_recurring = true; }
+  else if (date) { body.closed_date = date; body.is_recurring = false; }
+  else { toast('曜日または日付を選択してください', 'error'); return; }
+  try {
+    await api('/api/closed-days', {method:'POST', body:JSON.stringify(body)});
+    toast('定休日を追加しました', 'success');
+    loadClosedDays();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function deleteClosedDay(cid) {
+  if (!confirm('削除しますか？')) return;
+  try {
+    await api('/api/closed-days/' + cid, {method:'DELETE'});
+    toast('削除しました', 'success');
+    loadClosedDays();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 顧客 ---
+async function loadCustomers() {
+  try {
+    const res = await api('/api/customers');
+    const tbody = document.getElementById('customer-table');
+    tbody.innerHTML = (res.data||[]).map(c => {
+      const created = c.created_at ? new Date(c.created_at).toLocaleDateString('ja-JP') : '-';
+      return '<tr><td>' + (c.display_name||'-') + '</td><td>' + (c.phone||'-') + '</td>'
+        + '<td>' + (c.visit_count||0) + '回</td><td>' + created + '</td></tr>';
+    }).join('');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 設定 ---
+async function loadDeadline() {
+  try {
+    const res = await api('/api/settings/booking-deadline');
+    document.getElementById('deadline-hours').value = res.value || 2;
+  } catch(e) {}
+}
+
+async function saveDeadline() {
+  const hours = parseInt(document.getElementById('deadline-hours').value);
+  try {
+    await api('/api/settings/booking-deadline', {method:'POST', body:JSON.stringify({hours})});
+    toast('保存しました', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 初期化 ---
+document.getElementById('filter-date').value = new Date().toISOString().split('T')[0];
+initPhoneForm();
+loadReservations();
+</script>
+</body></html>"""
+# ログイン試行の記録用（メモリ保持のため再起動でリセットされます）
+LOGIN_ATTEMPTS = {}  # 形式: { "ip": {"count": 0, "lock_until": datetime} }
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_DURATION = datetime.timedelta(minutes=15)
+
+def get_client_ip():
+    """Render等のプロキシ環境下で正しい接続元IPを取得"""
+    if request.headers.get('X-Forwarded-For'):
+        # プロキシ経由の場合、一番左のIPがクライアントのIP
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr
+
 @app.route("/dashboard/login", methods=["GET", "POST"])
 def dashboard_login():
+    ip = get_client_ip()
+    now = datetime.datetime.now(JST)
+
+    # 1. IPごとのロック状態をチェック
+    if ip in LOGIN_ATTEMPTS:
+        lock_until = LOGIN_ATTEMPTS[ip].get("lock_until")
+        if lock_until and now < lock_until:
+            wait_min = int((lock_until - now).total_seconds() / 60) + 1
+            error_html = f'<div class="error">セキュリティロック中：あと{wait_min}分試行できません</div>'
+            return LOGIN_PAGE % (STORE_NAME, error_html), 403
+
     if request.method == "POST":
         pw = request.form.get("password", "")
+        
         if pw and pw == DASHBOARD_PASSWORD:
+            # ログイン成功：当該IPの試行記録をクリア
+            if ip in LOGIN_ATTEMPTS:
+                del LOGIN_ATTEMPTS[ip]
             flask_session["dashboard_authenticated"] = True
             return redirect(url_for("dashboard"))
-        error_html = '<div class="error">パスワードが正しくありません</div>'
+        
+        # ログイン失敗：試行回数を記録
+        if ip not in LOGIN_ATTEMPTS:
+            LOGIN_ATTEMPTS[ip] = {"count": 0, "lock_until": None}
+        
+        LOGIN_ATTEMPTS[ip]["count"] += 1
+        remaining = MAX_LOGIN_ATTEMPTS - LOGIN_ATTEMPTS[ip]["count"]
+
+        if LOGIN_ATTEMPTS[ip]["count"] >= MAX_LOGIN_ATTEMPTS:
+            # 上限に達したためロック時間を設定
+            LOGIN_ATTEMPTS[ip]["lock_until"] = now + LOCKOUT_DURATION
+            error_html = '<div class="error">失敗回数が上限に達しました。15分間ロックされます。</div>'
+            logger.warning(f"🚨 セキュリティ警告：IP {ip} からのログイン試行が上限に達し、ロックされました。")
+        else:
+            error_html = f'<div class="error">パスワードが違います（あと{remaining}回でロック）</div>'
+        
         return LOGIN_PAGE % (STORE_NAME, error_html), 401
+
     return LOGIN_PAGE % (STORE_NAME, "")
 
 
@@ -1388,288 +1980,308 @@ def dashboard_logout():
 @app.route("/dashboard")
 @dashboard_auth_required
 def dashboard():
-    return render_template("dashboard.html", store_name=STORE_NAME)
+    menu_json = json.dumps([{"id":m["id"],"name":m["name"],"price":m["price"],"duration":m["duration"],"emoji":m["emoji"]} for m in MENU_ITEMS], ensure_ascii=False)
+    html = DASHBOARD_HTML.replace("{{STORE_NAME}}", STORE_NAME).replace("{{BRAND_COLOR}}", BRAND_COLOR).replace("%MENU_JSON%", menu_json)
+    return html
 
 
-# ━━━ ダッシュボードAPI ━━━
+# --- 予約API ---
 @app.route("/api/reservations")
 @dashboard_auth_required
-def api_reservations():
-    period = request.args.get("period", "week")
-    today = datetime.datetime.now(JST).date()
-
-    if period == "today":
-        start_date = today
-        end_date = today
-    elif period == "month":
-        start_date = today
-        end_date = today + datetime.timedelta(days=30)
-    else:
-        start_date = today
-        end_date = today + datetime.timedelta(days=7)
-
+def api_get_reservations():
+    date_from = request.args.get("date_from", datetime.datetime.now(JST).strftime("%Y-%m-%d"))
+    status_filter = request.args.get("status", "")
+    params = {
+        "select": "*",
+        "reservation_date": f"gte.{date_from}",
+        "order": "reservation_date.asc,reservation_time.asc",
+    }
+    if status_filter:
+        params["status"] = f"eq.{status_filter}"
     try:
-        rows = supabase_get("reservations", {
-            "select": "*",
-            "reservation_date": f"gte.{start_date.isoformat()}",
-            "order": "reservation_date.asc,reservation_time.asc",
-        })
-        if period != "month":
-            rows = [r for r in rows if r["reservation_date"] <= end_date.isoformat()]
-        return jsonify(rows)
+        rows = supabase_get("reservations", params)
+        return jsonify({"data": rows})
     except Exception as e:
+        logger.error(f"API予約取得エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/reservations/<int:rid>/cancel", methods=["POST"])
 @dashboard_auth_required
-def api_cancel(rid):
+def api_cancel_reservation(rid):
     try:
+        # カレンダーからも削除
         rows = supabase_get("reservations", {"select": "*", "id": f"eq.{rid}"})
         if rows:
-            r = rows[0]
-            event_id = r.get("calendar_event_id")
-            if event_id:
-                delete_calendar_event(event_id)
-            # LINEで通知
+            delete_calendar_event(rows[0].get("calendar_event_id"))
+            line_user_id = rows[0].get("line_user_id")
+
+        res = supabase_patch("reservations", {"status": "cancelled"}, {"id": f"eq.{rid}"})
+
+        # お客様にキャンセル通知
+        if rows and line_user_id:
             try:
-                line_bot_api.push_message(
-                    r["line_user_id"],
-                    TextSendMessage(text=(
-                        f"ご予約のキャンセルをお知らせします。\n\n"
-                        f"📅 {r['reservation_date']} {r['reservation_time']}\n"
-                        f"✂️ {r['menu_name']}\n\n"
-                        f"またのご予約をお待ちしております。"
-                    )),
-                )
+                r = rows[0]
+                push_text(line_user_id,
+                    f"⚠️ ご予約がキャンセルされました\n\n"
+                    f"📅 {r['reservation_date']} {r['reservation_time']}〜\n"
+                    f"🍽️ {r['menu_name']}\n"
+                    f"👥 {r['guests']}名\n\n"
+                    f"ご不明な点がございましたらお問い合わせください。")
             except Exception:
                 pass
-        supabase_patch("reservations", {"status": "cancelled"}, {"id": f"eq.{rid}"})
+
         return jsonify({"success": True})
     except Exception as e:
+        logger.error(f"APIキャンセルエラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/customers")
+# --- 電話予約登録API ---
+@app.route("/api/reservations/phone", methods=["POST"])
 @dashboard_auth_required
-def api_customers():
+def api_add_phone_reservation():
+    """ダッシュボードから電話予約を登録"""
+    body = request.get_json()
+    if not body:
+        return jsonify({"error": "リクエストボディが空です"}), 400
+
+    # バリデーション
+    date_str = body.get("reservation_date", "")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return jsonify({"error": "日付の形式が不正です（YYYY-MM-DD）"}), 400
+
+    time_str = body.get("reservation_time", "")
+    if not re.match(r"^\d{2}:\d{2}$", time_str):
+        return jsonify({"error": "時間の形式が不正です（HH:MM）"}), 400
+
+    valid, guest_count = validate_positive_int(body.get("guests", 0), max_val=MAX_SEATS)
+    if not valid:
+        return jsonify({"error": f"人数が不正です（1〜{MAX_SEATS}）"}), 400
+
+    valid_name, sanitized_name = validate_name(body.get("guest_name", ""))
+    if not valid_name:
+        return jsonify({"error": "お名前を入力してください（50文字以内）"}), 400
+
+    phone = body.get("phone", "")
+    if phone:
+        valid_phone, cleaned_phone = validate_phone(phone)
+        if not valid_phone:
+            return jsonify({"error": "電話番号の形式が不正です"}), 400
+        phone = cleaned_phone or phone
+
+    memo = sanitize_text(body.get("memo", ""), max_length=200)
+
+    # メニュー取得（任意。未指定なら「席のみ予約」）
+    menu_id = body.get("menu_id", "seat_only")
+    menu = next((m for m in MENU_ITEMS if m["id"] == menu_id), MENU_ITEMS[0])
+
+    # 滞在時間（任意。未指定ならメニューのデフォルト）
+    duration = int(body.get("duration_minutes", menu["duration"]))
+
+    # 定休日チェック
+    if db_is_closed_day(date_str):
+        return jsonify({"error": "指定日は定休日です"}), 400
+
+    # 空き席チェック
+    day_reservations = db_get_reservations_by_date(date_str)
+    slot_time = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    reserved_seats = 0
+    for r in day_reservations:
+        r_start = datetime.datetime.strptime(
+            f"{r['reservation_date']} {r['reservation_time']}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=JST)
+        r_end = r_start + datetime.timedelta(minutes=r.get("duration_minutes", 60))
+        if r_start <= slot_time < r_end:
+            reserved_seats += r["guests"]
+    available = MAX_SEATS - reserved_seats
+    if available < guest_count:
+        return jsonify({"error": f"空席が足りません（残り{available}席）"}), 400
+
+    # 予約データ作成
+    reservation_data = {
+        "line_user_id": "phone_reservation",
+        "guest_name": sanitized_name,
+        "phone": phone,
+        "menu_id": menu["id"],
+        "menu_name": menu["name"],
+        "guests": guest_count,
+        "reservation_date": date_str,
+        "reservation_time": time_str,
+        "duration_minutes": duration,
+        "total_price": menu["price"] * guest_count,
+        "status": "confirmed",
+        "source": "phone",
+        "memo": memo,
+    }
+
+    # Googleカレンダーに登録
+    cal_event_id = create_calendar_event(reservation_data)
+    reservation_data["calendar_event_id"] = cal_event_id
+
+    # DBに保存
+    saved = db_save_reservation(reservation_data)
+    if not saved:
+        return jsonify({"error": "予約の保存に失敗しました"}), 500
+
+    # オーナーLINE通知
+    notify_owner(saved)
+
+    return jsonify({"success": True, "data": saved})
+
+
+# --- 予約編集API ---
+@app.route("/api/reservations/<int:rid>", methods=["PATCH"])
+@dashboard_auth_required
+def api_update_reservation(rid):
+    """ダッシュボードから予約情報を編集"""
+    body = request.get_json()
+    if not body:
+        return jsonify({"error": "リクエストボディが空です"}), 400
+
+    update_data = {}
+
+    if "guest_name" in body:
+        valid, name = validate_name(body["guest_name"])
+        if valid:
+            update_data["guest_name"] = name
+
+    if "phone" in body:
+        if body["phone"]:
+            valid, cleaned = validate_phone(body["phone"])
+            if valid:
+                update_data["phone"] = cleaned or body["phone"]
+        else:
+            update_data["phone"] = ""
+
+    if "guests" in body:
+        valid, count = validate_positive_int(body["guests"], max_val=MAX_SEATS)
+        if valid:
+            update_data["guests"] = count
+
+    if "memo" in body:
+        update_data["memo"] = sanitize_text(body.get("memo", ""), max_length=200)
+
+    if "reservation_date" in body:
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", body["reservation_date"]):
+            update_data["reservation_date"] = body["reservation_date"]
+
+    if "reservation_time" in body:
+        if re.match(r"^\d{2}:\d{2}$", body["reservation_time"]):
+            update_data["reservation_time"] = body["reservation_time"]
+
+    if not update_data:
+        return jsonify({"error": "更新する項目がありません"}), 400
+
     try:
-        rows = supabase_get("customers", {
-            "select": "*",
-            "order": "visit_count.desc",
-        })
-        return jsonify(rows)
+        res = supabase_patch("reservations", update_data, {"id": f"eq.{rid}"})
+        return jsonify({"success": True, "data": res[0] if res else {}})
+    except Exception as e:
+        logger.error(f"予約更新エラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 設定API ---
+@app.route("/api/settings/booking-deadline")
+@dashboard_auth_required
+def api_get_booking_deadline():
+    try:
+        hours = get_booking_deadline_hours()
+        return jsonify({"value": hours})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/closed_days")
+@app.route("/api/settings/booking-deadline", methods=["POST"])
 @dashboard_auth_required
-def api_closed_days():
+def api_set_booking_deadline():
+    body = request.get_json()
+    hours = body.get("hours", 2)
+    valid, hours_int = validate_positive_int(hours, max_val=24)
+    if not valid and hours != 0:
+        return jsonify({"error": "無効な値です（0〜24）"}), 400
+    hours_int = int(hours) if hours == 0 else hours_int
     try:
-        rows = supabase_get("closed_days", {"select": "*", "order": "id.asc"})
-        return jsonify(rows)
+        db_set_setting("booking_deadline_hours", hours_int)
+        return jsonify({"success": True, "value": hours_int})
     except Exception as e:
+        logger.error(f"API設定更新エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/closed_days", methods=["POST"])
+# --- 定休日API ---
+@app.route("/api/closed-days")
+@dashboard_auth_required
+def api_get_closed_days():
+    try:
+        rows = supabase_get("closed_days", {"select": "*", "order": "day_of_week.asc,closed_date.asc"})
+        return jsonify({"data": rows})
+    except Exception as e:
+        logger.error(f"API定休日取得エラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/closed-days", methods=["POST"])
 @dashboard_auth_required
 def api_add_closed_day():
+    body = request.get_json()
+    if not body:
+        return jsonify({"error": "リクエストボディが空です"}), 400
+    # サニタイズ
+    safe_body = {}
+    if "day_of_week" in body:
+        valid, dow = validate_positive_int(body["day_of_week"], max_val=6)
+        if body["day_of_week"] == 0:
+            dow = 0
+            valid = True
+        if not valid:
+            return jsonify({"error": "曜日の値が不正です（0〜6）"}), 400
+        safe_body["day_of_week"] = dow
+    if "closed_date" in body:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(body["closed_date"])):
+            return jsonify({"error": "日付の形式が不正です（YYYY-MM-DD）"}), 400
+        safe_body["closed_date"] = body["closed_date"]
+    safe_body["reason"] = sanitize_text(body.get("reason", "定休日"), max_length=100)
+    safe_body["is_recurring"] = bool(body.get("is_recurring", False))
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "リクエストボディが空です"}), 400
-        safe_data = {}
-        if "day_of_week" in data:
-            v = data["day_of_week"]
-            if not (isinstance(v, int) and 0 <= v <= 6):
-                return jsonify({"error": "曜日の値が不正です（0〜6）"}), 400
-            safe_data["day_of_week"] = v
-        if "closed_date" in data:
-            if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(data["closed_date"])):
-                return jsonify({"error": "日付の形式が不正です"}), 400
-            safe_data["closed_date"] = data["closed_date"]
-        safe_data["reason"] = sanitize_text(data.get("reason", "定休日"), max_length=100)
-        safe_data["is_recurring"] = bool(data.get("is_recurring", False))
-        res = supabase_post("closed_days", safe_data)
-        return jsonify(res[0] if res else {})
+        res = supabase_post("closed_days", safe_body)
+        return jsonify({"data": res})
     except Exception as e:
+        logger.error(f"API定休日追加エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/closed_days/<int:cid>", methods=["DELETE"])
+@app.route("/api/closed-days/<int:cid>", methods=["DELETE"])
 @dashboard_auth_required
 def api_delete_closed_day(cid):
     try:
-        supabase_delete("closed_days", {"id": f"eq.{cid}"})
+        url = f"{SUPABASE_URL}/rest/v1/closed_days"
+        res = http_requests.delete(url, headers=SUPABASE_HEADERS, params={"id": f"eq.{cid}"})
+        res.raise_for_status()
         return jsonify({"success": True})
     except Exception as e:
+        logger.error(f"API定休日削除エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-# ━━━ スタッフ管理API ━━━
-@app.route("/api/staff")
+# --- 顧客API ---
+@app.route("/api/customers")
 @dashboard_auth_required
-def api_staff():
+def api_get_customers():
     try:
-        rows = supabase_get("staff", {"select": "*", "order": "sort_order.asc"})
-        return jsonify(rows)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/staff", methods=["POST"])
-@dashboard_auth_required
-def api_add_staff():
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "リクエストボディが空です"}), 400
-        safe_data = {
-            "name": sanitize_text(data.get("name", ""), max_length=50),
-            "is_active": bool(data.get("is_active", True)),
-            "sort_order": int(data.get("sort_order", 0)),
-        }
-        if not safe_data["name"]:
-            return jsonify({"error": "スタッフ名は必須です"}), 400
-        res = supabase_post("staff", safe_data)
-        return jsonify(res[0] if res else {})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/staff/<int:sid>", methods=["PATCH"])
-@dashboard_auth_required
-def api_update_staff(sid):
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "リクエストボディが空です"}), 400
-        safe_data = {}
-        if "name" in data:
-            safe_data["name"] = sanitize_text(data["name"], max_length=50)
-        if "is_active" in data:
-            safe_data["is_active"] = bool(data["is_active"])
-        if "sort_order" in data:
-            safe_data["sort_order"] = int(data["sort_order"])
-        res = supabase_patch("staff", safe_data, {"id": f"eq.{sid}"})
-        return jsonify(res[0] if res else {})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/staff/<int:sid>", methods=["DELETE"])
-@dashboard_auth_required
-def api_delete_staff(sid):
-    try:
-        supabase_patch("staff", {"is_active": False}, {"id": f"eq.{sid}"})
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ━━━ スタッフ休日管理API ━━━
-@app.route("/api/staff/<int:sid>/days_off")
-@dashboard_auth_required
-def api_staff_days_off(sid):
-    try:
-        rows = supabase_get("staff_days_off", {
+        rows = supabase_get("customers", {
             "select": "*",
-            "staff_id": f"eq.{sid}",
-            "order": "id.asc",
+            "order": "visit_count.desc,created_at.desc",
         })
-        return jsonify(rows)
+        return jsonify({"data": rows})
     except Exception as e:
+        logger.error(f"API顧客取得エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/staff/<int:sid>/days_off", methods=["POST"])
-@dashboard_auth_required
-def api_add_staff_day_off(sid):
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "��クエストボディが空です"}), 400
-        safe_data = {"staff_id": sid}
-        if "day_of_week" in data:
-            v = data["day_of_week"]
-            if not (isinstance(v, int) and 0 <= v <= 6):
-                return jsonify({"error": "曜日の値が��正です（0〜6）"}), 400
-            safe_data["day_of_week"] = v
-        if "off_date" in data:
-            if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(data["off_date"])):
-                return jsonify({"error": "日付の形式が不正です"}), 400
-            safe_data["off_date"] = data["off_date"]
-        safe_data["is_recurring"] = bool(data.get("is_recurring", False))
-        res = supabase_post("staff_days_off", safe_data)
-        return jsonify(res[0] if res else {})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/staff_days_off/<int:did>", methods=["DELETE"])
-@dashboard_auth_required
-def api_delete_staff_day_off(did):
-    try:
-        supabase_delete("staff_days_off", {"id": f"eq.{did}"})
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ━━━ 設定API ━━━
-@app.route("/api/settings/deadline")
-@dashboard_auth_required
-def api_get_deadline():
-    hours = get_booking_deadline_hours()
-    return jsonify({"booking_deadline_hours": hours})
-
-
-@app.route("/api/settings/deadline", methods=["POST"])
-@dashboard_auth_required
-def api_set_deadline():
-    data = request.get_json()
-    hours = data.get("hours", 1)
-    db_set_setting("booking_deadline_hours", str(hours))
-    return jsonify({"success": True, "booking_deadline_hours": hours})
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# リマインド（前日通知）
+# 起動
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def send_reminders():
-    reminders = db_get_tomorrow_reminders()
-    for r in reminders:
-        try:
-            staff_text = r.get("staff_name") or "担当未定"
-            text = (
-                f"📅 明日のご予約リマインド\n\n"
-                f"🕐 {r['reservation_time']}〜\n"
-                f"✂️ {r['menu_name']}\n"
-                f"👤 担当: {staff_text}\n\n"
-                f"ご来店お待ちしております！"
-            )
-            line_bot_api.push_message(r["line_user_id"], TextSendMessage(text=text))
-            db_mark_reminded(r["id"])
-        except Exception as e:
-            logger.error(f"リマインド送信エラー: {e}")
-
-
-# スケジューラ（毎日18時にリマインド ＋ 10分毎に期限切れセッション削除）
-scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
-scheduler.add_job(send_reminders, "cron", hour=18, minute=0)
-scheduler.add_job(cleanup_expired_sessions, "interval", minutes=10)
-scheduler.start()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# トップページ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@app.route("/")
-def index():
-    return f"{STORE_NAME} LINE予約Bot is running!"
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
